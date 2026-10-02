@@ -95,7 +95,11 @@ class FakeContext {
 	readonly selectCalls: Array<{ title: string; options: string[] }> = [];
 	readonly selectResults: string[] = [];
 	hasUI = true;
-	readonly sessionManager = { getSessionId: () => "integration-session" };
+	branch: Array<{ type: "message"; message: { role: string; content: unknown } }> = [];
+	readonly sessionManager = {
+		getSessionId: () => "integration-session",
+		getBranch: () => this.branch,
+	};
 	readonly modelRegistry = {
 		getAvailable: () => this.models,
 		find: (provider: string, id: string) => this.models.find((candidate) => candidate.provider === provider && candidate.id === id),
@@ -405,6 +409,50 @@ test("previews a route without sending a provider request", async () => {
 	} finally {
 		fixture.restore();
 	}
+});
+
+test("routes an extension-triggered turn without before_agent_start", async () => {
+	const f = await setup();
+	let calls = 0;
+	for (const provider of ["openai", "anthropic"]) f.ctx.providers.set(provider, {
+		streamSimple: () => { calls++; return streamFromEvents([doneEvent("ok")]); },
+	});
+	try {
+		f.ctx.branch = [{ type: "message", message: { role: "user", content: [{ type: "text", text: "Explain this" }] } }];
+		await f.pi.emit("session_start", { type: "session_start", reason: "startup" }, f.ctx);
+		await f.pi.emit("agent_start", { type: "agent_start" }, f.ctx);
+		assert.equal((await dispatch(f)).at(-1)?.type, "done");
+		assert.equal(calls, 1);
+		assert.equal(f.ctx.notifications.filter((m) => m.includes("Pi Auto Model →")).length, 1);
+	} finally { f.restore(); }
+});
+
+test("routes a normal run only once and routes again after it settles", async () => {
+	const f = await setup();
+	try {
+		await begin(f, "Explain this");
+		await f.pi.emit("agent_start", { type: "agent_start" }, f.ctx);
+		await f.pi.emit("agent_start", { type: "agent_start" }, f.ctx);
+		assert.equal(f.ctx.notifications.filter((m) => m.includes("Pi Auto Model →")).length, 1);
+		await f.pi.emit("agent_settled", { type: "agent_settled" }, f.ctx);
+		await f.pi.emit("agent_start", { type: "agent_start" }, f.ctx);
+		assert.equal(f.ctx.notifications.filter((m) => m.includes("Pi Auto Model →")).length, 2);
+	} finally { f.restore(); }
+});
+
+test("does not override a blocked run on agent_start", async () => {
+	const f = await setup({ budget: { maxUsdPerTask: 0.000001, onExceed: "block" } });
+	let calls = 0;
+	for (const provider of ["openai", "anthropic"]) f.ctx.providers.set(provider, {
+		streamSimple: () => { calls++; return streamFromEvents([doneEvent("wrong")]); },
+	});
+	try {
+		await begin(f, "Explain this");
+		await f.pi.emit("agent_start", { type: "agent_start" }, f.ctx);
+		assert.equal((await dispatch(f)).at(-1)?.type, "error");
+		assert.equal(calls, 0);
+		assert.equal(f.ctx.notifications.filter((m) => m.includes("budget exceeded")).length, 1);
+	} finally { f.restore(); }
 });
 
 test("blocks a task before changing the current model when budget is exceeded", async () => {

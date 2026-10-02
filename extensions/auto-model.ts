@@ -187,6 +187,27 @@ function safeHandler<E>(
 	};
 }
 
+function latestPromptText(ctx: ExtensionContext): string {
+	try {
+		const branch = ctx.sessionManager.getBranch();
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const entry = branch[i];
+			if (!entry || entry.type !== "message") continue;
+			const message = entry.message;
+			if (message.role !== "user" && message.role !== "custom") continue;
+			const content = message.content;
+			if (typeof content === "string") return content;
+			if (Array.isArray(content)) {
+				return content.map((part) => part?.type === "text" ? part.text ?? "" : "").join("\n");
+			}
+			return "";
+		}
+	} catch {
+		// A missing or unavailable branch should not prevent routing.
+	}
+	return "";
+}
+
 function contextIsCompatible(ctx: ExtensionContext): boolean {
 	const probe = probeContextCapabilities(ctx);
 	if (!probe.ok) {
@@ -223,6 +244,8 @@ export default function autoModel(pi: ExtensionAPI): void {
 	const pendingStreams = new Map<string, PendingStreamRequest>();
 	const reservations = new Map<string, BudgetReservation>();
 	const routerHealth = new Map<string, { failures: number; bypassUntil?: number }>();
+	// A run can emit agent_start again during tool-loop continuations.
+	const runRouted = new Set<string>();
 	let modelRegistry: ModelRegistry | undefined;
 	const pendingFor = (sessionId?: string): PendingStreamRequest | undefined => {
 		if (sessionId) return pendingStreams.get(sessionId);
@@ -562,19 +585,30 @@ export default function autoModel(pi: ExtensionAPI): void {
 		}),
 	);
 
-	pi.on(
-		"before_agent_start",
-		safeHandler<BeforeAgentStartEvent>("before_agent_start", async (_event, ctx) => {
+	// Extension-triggered turns can start without before_agent_start.
+	pi.on("agent_start", safeHandler<unknown>("agent_start", async (_event, ctx) => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (runRouted.has(sessionId) || !isAutoModel(ctx.model)) return;
+		runRouted.add(sessionId);
+		await routeRun({ type: "before_agent_start", prompt: latestPromptText(ctx) } as BeforeAgentStartEvent, ctx, false);
+	}));
+
+	pi.on("before_agent_start", safeHandler<BeforeAgentStartEvent>("before_agent_start", async (event, ctx) => {
+		runRouted.add(ctx.sessionManager.getSessionId());
+		await routeRun(event, ctx, true);
+	}));
+
+	async function routeRun(_event: BeforeAgentStartEvent, ctx: ExtensionContext, fromUserPrompt: boolean): Promise<void> {
 			if (!contextIsCompatible(ctx)) {
 				return;
 			}
 
 			const state = stateForContext(store, ctx);
 			const config = configs.get(state.sessionId) ?? DEFAULT_CONFIG;
-			const allowPrefix = !state.initialPromptHandled;
+			const allowPrefix = fromUserPrompt && !state.initialPromptHandled;
 			// A new user task must never inherit an earlier task's dispatch permission.
 			pendingStreams.delete(state.sessionId);
-			state.initialPromptHandled = true;
+			if (fromUserPrompt) state.initialPromptHandled = true;
 			forceSettleStaleTask(state, Date.now());
 			settlePendingActivation(state);
 			if (state.activation !== "active") {
@@ -614,8 +648,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 			}
 			// Degrade to a working real model so the request can proceed.
 			applyFallbackPlan(_event, ctx, state, config, requestId, allowPrefix);
-		}),
-	);
+	}
 
 	// ─── Shared routing pipeline for execution and local previews ───
 	async function applyAutoRoute(
@@ -1362,6 +1395,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 	}
 
 	pi.on("agent_settled", safeHandler<AgentSettledEvent>("agent_settled", (_event, ctx) => {
+		runRouted.delete(ctx.sessionManager.getSessionId());
 		settleActiveTask(ctx, ctx.sessionManager.getSessionId());
 	}));
 
@@ -1534,6 +1568,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 			store.delete(ctx.sessionManager.getSessionId());
 			pendingStreams.delete(ctx.sessionManager.getSessionId());
 			routerHealth.delete(ctx.sessionManager.getSessionId());
+			runRouted.delete(ctx.sessionManager.getSessionId());
 		}),
 	);
 }
