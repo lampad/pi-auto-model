@@ -95,11 +95,7 @@ class FakeContext {
 	readonly selectCalls: Array<{ title: string; options: string[] }> = [];
 	readonly selectResults: string[] = [];
 	hasUI = true;
-	branch: Array<{ type: "message"; message: { role: string; content: unknown } }> = [];
-	readonly sessionManager = {
-		getSessionId: () => "integration-session",
-		getBranch: () => this.branch,
-	};
+	readonly sessionManager = { getSessionId: () => "integration-session" };
 	readonly modelRegistry = {
 		getAvailable: () => this.models,
 		find: (provider: string, id: string) => this.models.find((candidate) => candidate.provider === provider && candidate.id === id),
@@ -418,25 +414,57 @@ test("routes an extension-triggered turn without before_agent_start", async () =
 		streamSimple: () => { calls++; return streamFromEvents([doneEvent("ok")]); },
 	});
 	try {
-		f.ctx.branch = [{ type: "message", message: { role: "user", content: [{ type: "text", text: "Explain this" }] } }];
 		await f.pi.emit("session_start", { type: "session_start", reason: "startup" }, f.ctx);
 		await f.pi.emit("agent_start", { type: "agent_start" }, f.ctx);
+		assert.equal(routeNotices(f).length, 0);
+		await f.pi.emit("context", { type: "context", messages: [
+			{ role: "user", content: [{ type: "text", text: "Explain this" }] },
+		] }, f.ctx);
 		assert.equal((await dispatch(f)).at(-1)?.type, "done");
 		assert.equal(calls, 1);
-		assert.equal(f.ctx.notifications.filter((m) => m.includes("Pi Auto Model →")).length, 1);
+		assert.equal(routeNotices(f).length, 1);
+		// Later context events in the same run reuse the plan.
+		await f.pi.emit("context", { type: "context", messages: [] }, f.ctx);
+		assert.equal(routeNotices(f).length, 1);
 	} finally { f.restore(); }
+});
+
+test("routes an extension-triggered turn on its triggering message, not an earlier prompt", async () => {
+	const trigger = "Subagent finished: refactor the authentication module, add migrations, and fix the failing integration tests across the repository.";
+	const stale = await setup();
+	const expected = await setup();
+	const f = await setup();
+	try {
+		await begin(stale, "hi");
+		await begin(expected, trigger);
+		const expectedRoute = routeNotices(expected).at(-1);
+		assert.ok(expectedRoute);
+		assert.notEqual(routeNotices(stale).at(-1), expectedRoute);
+		await f.pi.emit("session_start", { type: "session_start", reason: "startup" }, f.ctx);
+		await f.pi.emit("agent_start", { type: "agent_start" }, f.ctx);
+		await f.pi.emit("context", { type: "context", messages: [
+			{ role: "user", content: [{ type: "text", text: "hi" }] },
+			{ role: "assistant", content: [{ type: "text", text: "Hello" }] },
+			{ role: "custom", customType: "subagent-result", content: trigger },
+		] }, f.ctx);
+		assert.equal(routeNotices(f).at(-1), expectedRoute);
+	} finally { f.restore(); expected.restore(); stale.restore(); }
 });
 
 test("routes a normal run only once and routes again after it settles", async () => {
 	const f = await setup();
+	const context = { type: "context", messages: [{ role: "user", content: "Explain this" }] };
 	try {
 		await begin(f, "Explain this");
 		await f.pi.emit("agent_start", { type: "agent_start" }, f.ctx);
+		await f.pi.emit("context", context, f.ctx);
 		await f.pi.emit("agent_start", { type: "agent_start" }, f.ctx);
-		assert.equal(f.ctx.notifications.filter((m) => m.includes("Pi Auto Model →")).length, 1);
+		await f.pi.emit("context", context, f.ctx);
+		assert.equal(routeNotices(f).length, 1);
 		await f.pi.emit("agent_settled", { type: "agent_settled" }, f.ctx);
 		await f.pi.emit("agent_start", { type: "agent_start" }, f.ctx);
-		assert.equal(f.ctx.notifications.filter((m) => m.includes("Pi Auto Model →")).length, 2);
+		await f.pi.emit("context", context, f.ctx);
+		assert.equal(routeNotices(f).length, 2);
 	} finally { f.restore(); }
 });
 
@@ -449,6 +477,7 @@ test("does not override a blocked run on agent_start", async () => {
 	try {
 		await begin(f, "Explain this");
 		await f.pi.emit("agent_start", { type: "agent_start" }, f.ctx);
+		await f.pi.emit("context", { type: "context", messages: [{ role: "user", content: "Explain this" }] }, f.ctx);
 		assert.equal((await dispatch(f)).at(-1)?.type, "error");
 		assert.equal(calls, 0);
 		assert.equal(f.ctx.notifications.filter((m) => m.includes("budget exceeded")).length, 1);
@@ -739,6 +768,10 @@ test("temporarily bypasses routing after repeated internal failures", async () =
 async function begin(fixture: Awaited<ReturnType<typeof setup>>, prompt = "hello"): Promise<void> {
 	await fixture.pi.emit("session_start", { type: "session_start", reason: "startup" }, fixture.ctx);
 	await fixture.pi.emit("before_agent_start", { type: "before_agent_start", prompt, systemPrompt: "", systemPromptOptions: {} }, fixture.ctx);
+}
+
+function routeNotices(fixture: Awaited<ReturnType<typeof setup>>): string[] {
+	return fixture.ctx.notifications.filter((message) => message.includes("Pi Auto Model →"));
 }
 
 async function dispatch(fixture: Awaited<ReturnType<typeof setup>>): Promise<AssistantMessageEvent[]> {

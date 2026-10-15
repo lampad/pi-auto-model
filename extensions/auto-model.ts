@@ -187,23 +187,18 @@ function safeHandler<E>(
 	};
 }
 
-function latestPromptText(ctx: ExtensionContext): string {
-	try {
-		const branch = ctx.sessionManager.getBranch();
-		for (let i = branch.length - 1; i >= 0; i--) {
-			const entry = branch[i];
-			if (!entry || entry.type !== "message") continue;
-			const message = entry.message;
-			if (message.role !== "user" && message.role !== "custom") continue;
-			const content = message.content;
-			if (typeof content === "string") return content;
-			if (Array.isArray(content)) {
-				return content.map((part) => part?.type === "text" ? part.text ?? "" : "").join("\n");
-			}
-			return "";
+function latestPromptText(messages: ContextEvent["messages"]): string {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i] as { role?: string; content?: unknown } | undefined;
+		if (!message || (message.role !== "user" && message.role !== "custom")) continue;
+		const content = message.content;
+		if (typeof content === "string") return content;
+		if (Array.isArray(content)) {
+			return content
+				.map((part: { type?: string; text?: string } | undefined) => part?.type === "text" ? part.text ?? "" : "")
+				.join("\n");
 		}
-	} catch {
-		// A missing or unavailable branch should not prevent routing.
+		return "";
 	}
 	return "";
 }
@@ -246,6 +241,9 @@ export default function autoModel(pi: ExtensionAPI): void {
 	const routerHealth = new Map<string, { failures: number; bypassUntil?: number }>();
 	// A run can emit agent_start again during tool-loop continuations.
 	const runRouted = new Set<string>();
+	// Runs started without before_agent_start, waiting for their first context
+	// event to see the triggering message.
+	const runAwaitingRoute = new Set<string>();
 	let modelRegistry: ModelRegistry | undefined;
 	const pendingFor = (sessionId?: string): PendingStreamRequest | undefined => {
 		if (sessionId) return pendingStreams.get(sessionId);
@@ -585,12 +583,20 @@ export default function autoModel(pi: ExtensionAPI): void {
 		}),
 	);
 
-	// Extension-triggered turns can start without before_agent_start.
-	pi.on("agent_start", safeHandler<unknown>("agent_start", async (_event, ctx) => {
+	// Extension-triggered turns (e.g. sendMessage with triggerTurn) start
+	// without before_agent_start. Their triggering message is only appended
+	// after agent_start, so routing waits for the first context event.
+	pi.on("agent_start", safeHandler<unknown>("agent_start", (_event, ctx) => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		if (runRouted.has(sessionId) || !isAutoModel(ctx.model)) return;
 		runRouted.add(sessionId);
-		await routeRun({ type: "before_agent_start", prompt: latestPromptText(ctx) } as BeforeAgentStartEvent, ctx, false);
+		runAwaitingRoute.add(sessionId);
+	}));
+
+	pi.on("context", safeHandler<ContextEvent>("context", async (event, ctx) => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (!runAwaitingRoute.delete(sessionId) || !isAutoModel(ctx.model)) return;
+		await routeRun({ type: "before_agent_start", prompt: latestPromptText(event.messages) } as BeforeAgentStartEvent, ctx, false);
 	}));
 
 	pi.on("before_agent_start", safeHandler<BeforeAgentStartEvent>("before_agent_start", async (event, ctx) => {
@@ -599,55 +605,55 @@ export default function autoModel(pi: ExtensionAPI): void {
 	}));
 
 	async function routeRun(_event: BeforeAgentStartEvent, ctx: ExtensionContext, fromUserPrompt: boolean): Promise<void> {
-			if (!contextIsCompatible(ctx)) {
-				return;
-			}
+		if (!contextIsCompatible(ctx)) {
+			return;
+		}
 
-			const state = stateForContext(store, ctx);
-			const config = configs.get(state.sessionId) ?? DEFAULT_CONFIG;
-			const allowPrefix = fromUserPrompt && !state.initialPromptHandled;
-			// A new user task must never inherit an earlier task's dispatch permission.
-			pendingStreams.delete(state.sessionId);
-			if (fromUserPrompt) state.initialPromptHandled = true;
-			forceSettleStaleTask(state, Date.now());
-			settlePendingActivation(state);
-			if (state.activation !== "active") {
-				return;
-			}
-			const requestId = randomUUID();
-			const health = routerHealth.get(state.sessionId);
-			if (health?.bypassUntil && health.bypassUntil > Date.now()) {
-				notifySafe(ctx, "Pi Auto Model routing is temporarily bypassed after repeated internal failures.", "warning");
-				applyFallbackPlan(_event, ctx, state, config, requestId, allowPrefix);
-				return;
-			}
-			if (health?.bypassUntil) routerHealth.delete(state.sessionId);
-
-			// Internal exceptions may use a constrained fallback; intentional
-			// policy stops must never be converted into dispatch permission.
-			let outcome: AutoRouteOutcome;
-			try {
-				outcome = await applyAutoRoute(_event, ctx, state, config, requestId, allowPrefix);
-			} catch (error) {
-				recordRouterFailure(state.sessionId);
-				notifySafe(ctx, `Pi Auto Model routing failed (${errorMessage(error)}). Falling back to a working model.`);
-				outcome = { status: "failed" };
-			}
-			if (outcome.status === "routed" || outcome.status === "blocked") {
-				if (outcome.status === "routed") routerHealth.delete(state.sessionId);
-				// Routed: session state, budgets and notifications were applied
-				// inside applyAutoRoute. Blocked: the user's configuration
-				// intentionally stopped this request (budget block); respect it.
-				return;
-			}
-			// A plan may already exist if applyAutoRoute produced one and then
-			// threw in a post-plan side effect (bookkeeping, notifications).
-			// Keep the valid plan instead of replacing it with the fallback.
-			if (pendingStreams.has(state.sessionId)) {
-				return;
-			}
-			// Degrade to a working real model so the request can proceed.
+		const state = stateForContext(store, ctx);
+		const config = configs.get(state.sessionId) ?? DEFAULT_CONFIG;
+		const allowPrefix = fromUserPrompt && !state.initialPromptHandled;
+		// A new user task must never inherit an earlier task's dispatch permission.
+		pendingStreams.delete(state.sessionId);
+		if (fromUserPrompt) state.initialPromptHandled = true;
+		forceSettleStaleTask(state, Date.now());
+		settlePendingActivation(state);
+		if (state.activation !== "active") {
+			return;
+		}
+		const requestId = randomUUID();
+		const health = routerHealth.get(state.sessionId);
+		if (health?.bypassUntil && health.bypassUntil > Date.now()) {
+			notifySafe(ctx, "Pi Auto Model routing is temporarily bypassed after repeated internal failures.", "warning");
 			applyFallbackPlan(_event, ctx, state, config, requestId, allowPrefix);
+			return;
+		}
+		if (health?.bypassUntil) routerHealth.delete(state.sessionId);
+
+		// Internal exceptions may use a constrained fallback; intentional
+		// policy stops must never be converted into dispatch permission.
+		let outcome: AutoRouteOutcome;
+		try {
+			outcome = await applyAutoRoute(_event, ctx, state, config, requestId, allowPrefix);
+		} catch (error) {
+			recordRouterFailure(state.sessionId);
+			notifySafe(ctx, `Pi Auto Model routing failed (${errorMessage(error)}). Falling back to a working model.`);
+			outcome = { status: "failed" };
+		}
+		if (outcome.status === "routed" || outcome.status === "blocked") {
+			if (outcome.status === "routed") routerHealth.delete(state.sessionId);
+			// Routed: session state, budgets and notifications were applied
+			// inside applyAutoRoute. Blocked: the user's configuration
+			// intentionally stopped this request (budget block); respect it.
+			return;
+		}
+		// A plan may already exist if applyAutoRoute produced one and then
+		// threw in a post-plan side effect (bookkeeping, notifications).
+		// Keep the valid plan instead of replacing it with the fallback.
+		if (pendingStreams.has(state.sessionId)) {
+			return;
+		}
+		// Degrade to a working real model so the request can proceed.
+		applyFallbackPlan(_event, ctx, state, config, requestId, allowPrefix);
 	}
 
 	// ─── Shared routing pipeline for execution and local previews ───
@@ -1396,6 +1402,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 
 	pi.on("agent_settled", safeHandler<AgentSettledEvent>("agent_settled", (_event, ctx) => {
 		runRouted.delete(ctx.sessionManager.getSessionId());
+		runAwaitingRoute.delete(ctx.sessionManager.getSessionId());
 		settleActiveTask(ctx, ctx.sessionManager.getSessionId());
 	}));
 
@@ -1569,6 +1576,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 			pendingStreams.delete(ctx.sessionManager.getSessionId());
 			routerHealth.delete(ctx.sessionManager.getSessionId());
 			runRouted.delete(ctx.sessionManager.getSessionId());
+			runAwaitingRoute.delete(ctx.sessionManager.getSessionId());
 		}),
 	);
 }
