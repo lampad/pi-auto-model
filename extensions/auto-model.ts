@@ -45,7 +45,8 @@ import {
 	resolvePiCandidates,
 } from "../src/pi/registry-adapter.ts";
 import { RuntimeStateStore } from "../src/pi/runtime-store.ts";
-import { planRoute } from "../src/routing/route-planner.ts";
+import { planRoute, hardConstraintFailure } from "../src/routing/route-planner.ts";
+import { requestContextTokens } from "../src/pi/request-context.ts";
 import { chooseFailoverTarget } from "../src/routing/failover.ts";
 import { chooseThinkingLevel } from "../src/routing/thinking-router.ts";
 import { CircuitBreaker } from "../src/health/circuit-breaker.ts";
@@ -86,6 +87,7 @@ import {
 } from "../src/quota/uvi.ts";
 import { QuotaAdapterRegistry } from "../src/quota/adapters.ts";
 import {
+	AUTO_MODEL_MAX_TOKENS,
 	isAutoModel,
 	AUTO_MODEL_ID,
 	AUTO_MODEL_PROVIDER,
@@ -305,29 +307,29 @@ export default function autoModel(pi: ExtensionAPI): void {
 		getPendingStream: pendingFor,
 		beforeAttempt: async (target, request, context) => {
 			const state = store.get(request.sessionId);
-			if (!state?.activeTask || !request.attemptId) return false;
+			if (!state?.activeTask || !request.attemptId) return "missing active task or dispatch identity";
 			return state.lock.run(async () => {
 				const task = state.activeTask;
-				if (!task || task.requestId !== request.requestId) return false;
+				if (!task || task.requestId !== request.requestId) return "active task does not match this request";
 				const config = configs.get(state.sessionId) ?? DEFAULT_CONFIG;
-				// ponytail: conservative text/JSON estimate; calibrate by tokenizer family when measured data is available.
-				const inputTokens = Math.max(task.inputTokens ?? 0, Math.ceil(JSON.stringify(context, (key, value) => key === "data" ? "" : value).length / 3));
+				const inputTokens = Math.max(task.inputTokens ?? 0, requestContextTokens(context));
 				const profile = { ...request.profile, constraints: {
 					...request.profile.constraints,
 					requiredContextTokens: inputTokens,
 					requiresVision: request.profile.constraints.requiresVision || JSON.stringify(context.messages, (key, value) => key === "data" ? "" : value).includes('"type":"image"'),
 				} };
-				if (!planRoute({ targets: [target], profile, contextTokens: inputTokens, capabilityOptions: { source: config.capabilitySource, overrides: config.benchmarkOverrides } })) return false;
+				const failure = hardConstraintFailure(target, profile, inputTokens, { source: config.capabilitySource, overrides: config.benchmarkOverrides });
+				if (failure) return failure;
 				const estimate = estimateCost(target, inputTokens, profile);
 				const limits = { ...config.budget, maxUsdPerTask: config.budget.maxUsdPerTask === undefined
 					? undefined : Math.max(0, config.budget.maxUsdPerTask - (task.budgetSpentUsd ?? 0)) };
 				const initial = budgetLedger.evaluate(estimate, target.model.provider, limits, Date.now(), state.sessionId);
-				if (initial.action === "block" || initial.action === "avoid") return false;
+				if (initial.action === "block" || initial.action === "avoid") return `budget ${initial.action}: ${initial.exceeded.join(", ")}`;
 				if (initial.action === "downgrade" && request.targets.some((candidate) =>
-					candidate.id !== target.id && estimateCost(candidate, inputTokens, profile) < estimate)) return false;
+					candidate.id !== target.id && estimateCost(candidate, inputTokens, profile) < estimate)) return "budget requires a cheaper route";
 				const at = Date.now();
 				const decision = await budgetLedger.reserve(target.model.provider, estimate, limits, at, state.sessionId);
-				if (decision.action === "block" || decision.action === "avoid") return false;
+				if (decision.action === "block" || decision.action === "avoid") return `budget reservation ${decision.action}: ${decision.exceeded.join(", ")}`;
 				reservations.set(request.attemptId!, { provider: target.model.provider, estimate, at, sessionId: state.sessionId });
 				task.budgetSpentUsd = (task.budgetSpentUsd ?? 0) + estimate;
 				return true;
@@ -823,6 +825,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 			}
 
 			const defaultPlan = planRoute({
+				outputTokenLimit: AUTO_MODEL_MAX_TOKENS,
 				targets: routeTargets,
 				profile,
 				currentTargetId: currentRouteId(state, ctx),
@@ -867,9 +870,12 @@ export default function autoModel(pi: ExtensionAPI): void {
 					}
 				: defaultPlan;
 			if (!plan) {
+				const failures = routeTargets.slice(0, 3).map((target) => `${target.id}: ${hardConstraintFailure(
+					target, profile, contextTokensOf(ctx), { source: config.capabilitySource, overrides: config.benchmarkOverrides }, Infinity,
+				) ?? "not eligible under the active pool"}`);
 				notifySafe(
 					ctx,
-					"Pi Auto Model: no eligible model can satisfy this task's vision, context, or output requirements. Request blocked.",
+					`Pi Auto Model: no eligible model can satisfy this task's vision, context, or output requirements. Request blocked. ${failures.join("; ")}`,
 					"error",
 				);
 				return { status: "blocked" };
@@ -879,6 +885,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 				: undefined;
 			const pinnedPlan = pinned
 				? planRoute({
+						outputTokenLimit: AUTO_MODEL_MAX_TOKENS,
 						targets: [pinned],
 						profile,
 						contextTokens: contextTokensOf(ctx),
@@ -902,6 +909,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 					: state.startupModelId;
 				const current = currentId ? plan.rankedTargets.find((target) => target.id === currentId) : undefined;
 				const currentPlan = current ? planRoute({
+					outputTokenLimit: AUTO_MODEL_MAX_TOKENS,
 					targets: [current],
 					profile,
 					contextTokens: contextTokensOf(ctx),
@@ -938,6 +946,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 					? routeTargets.filter((target) => target.model.provider !== effectivePlan.target.model.provider)
 					: routeTargets;
 				const cheaperPlan = planRoute({
+					outputTokenLimit: AUTO_MODEL_MAX_TOKENS,
 					targets: budgetTargets,
 					profile,
 					currentTargetId: currentRouteId(state, ctx),

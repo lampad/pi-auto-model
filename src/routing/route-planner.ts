@@ -25,6 +25,8 @@ export interface RoutePlannerInput {
 	profile: TaskProfile;
 	currentTargetId?: string;
 	contextTokens?: number;
+	/** Stream allowance, capped per target; Infinity reserves the target's full output limit. */
+	outputTokenLimit?: number;
 	policy?: RoutingPolicy;
 	preferences?: Readonly<Record<string, number>>;
 	quota?: ReadonlyMap<string, ProviderQuotaSignal>;
@@ -241,24 +243,28 @@ function qualityScore(target: RouteTarget, profile: TaskProfile, capabilityOptio
 	return Math.max(0, 1 - shortfall / totalDemand - complexityPenalty - riskPenalty);
 }
 
-function canSatisfyHardConstraints(
+export function hardConstraintFailure(
 	target: RouteTarget,
 	profile: TaskProfile,
 	contextTokens: number,
 	capabilityOptions?: CapabilityOptions,
-): boolean {
+	outputTokenLimit?: number,
+): string | undefined {
 	if (profile.constraints.requiresVision && !supportsVision(target.model)) {
-		return false;
+		return "vision input is not supported";
 	}
 	if (profile.constraints.minimumTier && tierRank(deriveCapabilityPrior(target.model, capabilityOptions).overall) < tierRank(profile.constraints.minimumTier)) {
-		return false;
+		return `minimum capability tier ${profile.constraints.minimumTier} is not satisfied`;
 	}
 
+	const outputTokens = outputTokenLimit === undefined ? profile.constraints.requiredOutputTokens
+		: Math.max(profile.constraints.requiredOutputTokens, Math.min(outputTokenLimit, target.model.maxTokens));
+	if (target.model.maxTokens < outputTokens) return `output capacity requires ${outputTokens} tokens; available ${target.model.maxTokens}`;
 	const safetyAdjustedContext = Math.ceil(Math.max(contextTokens, profile.constraints.requiredContextTokens) * 1.15);
-	return (
-		safetyAdjustedContext + profile.constraints.requiredOutputTokens <= target.model.contextWindow &&
-		target.model.maxTokens >= profile.constraints.requiredOutputTokens
-	);
+	if (safetyAdjustedContext + outputTokens > target.model.contextWindow) {
+		return `context capacity requires ${safetyAdjustedContext + outputTokens} tokens (${safetyAdjustedContext} input including 15% safety margin + ${outputTokens} output); available ${target.model.contextWindow}. Compact the context or select a larger-context model`;
+	}
+	return undefined;
 }
 
 function weights(policy: RoutingPolicy): {
@@ -427,7 +433,7 @@ export function planRoute(input: RoutePlannerInput): RoutePlan | undefined {
 		})
 		: input.targets;
 	const eligibleTargets = poolTargets.filter((target) =>
-		canSatisfyHardConstraints(target, input.profile, contextTokens, input.capabilityOptions),
+		hardConstraintFailure(target, input.profile, contextTokens, input.capabilityOptions, input.outputTokenLimit) === undefined,
 	);
 	if (eligibleTargets.length === 0) {
 		return undefined;

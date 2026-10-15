@@ -119,8 +119,10 @@ class FakeContext {
 		return false;
 	}
 
+	contextTokens = 0;
+
 	getContextUsage(): { tokens: number; contextWindow: number } {
-		return { tokens: 0, contextWindow: 200_000 };
+		return { tokens: this.contextTokens, contextWindow: 200_000 };
 	}
 
 	ui = {
@@ -405,6 +407,38 @@ test("previews a route without sending a provider request", async () => {
 	} finally {
 		fixture.restore();
 	}
+});
+
+test("accepts a request whose Pi context estimate fits despite large serialized context", async () => {
+	const f = await setup();
+	let calls = 0;
+	f.ctx.contextTokens = 130_000;
+	f.ctx.providers.set("openai", { streamSimple: () => { calls++; return streamFromEvents([doneEvent("ok")]); } });
+	try {
+		await begin(f);
+		const context = { messages: [{ role: "user", content: "x".repeat(600_000) }] } as never;
+		const events = await collectEvents(f.pi.providerConfigs.get("pi-auto-model")!.streamSimple!(
+			f.ctx.model, context, { sessionId: "integration-session" },
+		));
+		assert.equal(events.at(-1)?.type, "done");
+		assert.equal(calls, 1);
+	} finally { f.restore(); }
+});
+
+test("rejects context growth that exceeds target capacity at dispatch", async () => {
+	const f = await setup();
+	let calls = 0;
+	f.ctx.contextTokens = 130_000;
+	f.ctx.providers.set("openai", { streamSimple: () => { calls++; return streamFromEvents([doneEvent("wrong")]); } });
+	try {
+		await begin(f);
+		const events = await collectEvents(f.pi.providerConfigs.get("pi-auto-model")!.streamSimple!(
+			f.ctx.model, { messages: [{ role: "user", content: "x".repeat(720_000) }] },
+			{ sessionId: "integration-session" },
+		));
+		assert.equal(events.at(-1)?.type, "error");
+		assert.equal(calls, 0);
+	} finally { f.restore(); }
 });
 
 test("routes an extension-triggered turn without before_agent_start", async () => {
