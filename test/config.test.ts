@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdtemp, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "../src/config/loader.ts";
+import { loadConfig, mergeConfig } from "../src/config/loader.ts";
 import { appendDecision } from "../src/storage/jsonl.ts";
 
 test("loads configuration with safe defaults", async () => {
@@ -96,6 +96,64 @@ test("rejects an out-of-range cost policy quality floor", async () => {
 	const file = join(dir, "auto-model.json");
 	await writeFile(file, JSON.stringify({ costPolicy: { qualityFloor: 2 } }));
 	assert.equal((await loadConfig(file)).costPolicy, undefined);
+});
+
+test("drops invalid rules individually and records diagnostics", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "auto-model-"));
+	const file = join(dir, "auto-model.json");
+	await writeFile(file, JSON.stringify({
+		policy: "best",
+		rules: [
+			{ name: "good", when: { kinds: ["review"] }, then: { policy: "cost" } },
+			{ name: "bad", when: { kinds: ["review"] }, then: { minimumTier: "huge" } },
+		],
+	}));
+	const config = await loadConfig(file);
+	assert.equal(config.policy, "best", "a bad rule does not invalidate the rest of the file");
+	assert.deepEqual(config.rules?.map((rule) => rule.name), ["good"]);
+	assert.equal(config.diagnostics?.length, 1);
+	assert.match(config.diagnostics![0], /rule "bad" ignored: "minimumTier"/);
+});
+
+test("reports invalid JSON and invalid configuration instead of failing silently", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "auto-model-"));
+	const broken = join(dir, "broken.json");
+	await writeFile(broken, "{ not json");
+	assert.match((await loadConfig(broken)).diagnostics![0], /invalid JSON; using defaults/);
+	const invalid = join(dir, "invalid.json");
+	await writeFile(invalid, JSON.stringify({ policy: "best", shadow: { enabled: "yes" } }));
+	const config = await loadConfig(invalid);
+	assert.match(config.diagnostics![0], /invalid configuration; using defaults/);
+	assert.equal(config.policy, "balanced");
+	assert.deepEqual((await loadConfig(join(dir, "missing.json"))).diagnostics, [], "a missing file is not an issue");
+});
+
+test("project rules run before global rules and diagnostics are combined", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "auto-model-"));
+	const globalFile = join(dir, "global.json");
+	const projectFile = join(dir, "project.json");
+	await writeFile(globalFile, JSON.stringify({
+		scenarios: { review: "best", debug: "cost" },
+		rules: [{ name: "global", then: { policy: "cost" } }, { name: "global-bad", then: {} }],
+	}));
+	await writeFile(projectFile, JSON.stringify({
+		scenarios: { review: "anthropic/*" },
+		rules: [{ name: "project", then: { policy: "best" } }],
+	}));
+	const global = await loadConfig(globalFile);
+	const merged = mergeConfig(global, await loadConfig(projectFile, global));
+	assert.deepEqual(merged.rules?.map((rule) => rule.name), ["project", "global"]);
+	assert.deepEqual(merged.scenarios, { review: { only: ["anthropic/*"] }, debug: { policy: "cost" } }, "project scenarios replace global ones by name");
+	assert.equal(merged.diagnostics?.length, 1);
+});
+
+test("reports unknown scenario names with a suggestion", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "auto-model-"));
+	const file = join(dir, "auto-model.json");
+	await writeFile(file, JSON.stringify({ scenarios: { reviews: "best", vision: "openai/gpt-5" } }));
+	const config = await loadConfig(file);
+	assert.deepEqual(config.scenarios, { vision: { only: ["openai/gpt-5"] } });
+	assert.match(config.diagnostics![0], /unknown scenario "reviews" ignored \(did you mean "review"\?\)/);
 });
 
 test("appends decisions as JSONL", async () => {

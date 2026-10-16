@@ -19,6 +19,7 @@ import {
 import { chooseThinkingLevel } from "./thinking-router.ts";
 import { quotaScore } from "../quota/uvi.ts";
 import type { QualitySignal } from "./quality-learning.ts";
+import { RULE_PREFER_BONUS } from "./rules.ts";
 
 export interface RoutePlannerInput {
 	targets: readonly RouteTarget[];
@@ -43,6 +44,8 @@ export interface RoutePlannerInput {
 	/** Minimum quality score required for cost-policy selection. Defaults to 0 (no floor). */
 	costQualityFloor?: number;
 	capabilityOptions?: CapabilityOptions;
+	/** Targets preferred by a matching scenario rule; each receives RULE_PREFER_BONUS utility. */
+	preferredTargetIds?: ReadonlySet<string>;
 }
 
 /**
@@ -386,6 +389,7 @@ function scoreTarget(
 			quota * scoreWeights.quota +
 			(pool ?? 0.5) * scoreWeights.pool +
 			(input.preferences?.[target.id] ?? 0) * 0.5 +
+			(input.preferredTargetIds?.has(target.id) ? RULE_PREFER_BONUS : 0) +
 			cacheAdjustment,
 	};
 }

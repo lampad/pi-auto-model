@@ -25,10 +25,13 @@ import { formatPriceSummary, type ResolvedModelPrice } from "../pricing/price-ca
 import { updateAutoModelStatus } from "./status.ts";
 import type { UnifiedEvent } from "../observability/event-store.ts";
 import type { QualityLearning } from "../routing/quality-learning.ts";
+import { describeRule, type RoutingRule } from "../routing/rules.ts";
+import { coldCacheReason } from "../routing/cache-state.ts";
 
 const FEEDBACK_LOG = join(homedir(), ".pi", "agent", "auto-model", "feedback.jsonl");
 
-const COMMANDS = ["on", "off", "status", "why", "plan", "models", "providers", "history", "metrics", "quota", "budget", "pool", "export", "doctor", "mode", "pin", "unpin", "thinking", "feedback"] as const;
+const COMMANDS = ["on", "off", "status", "why", "plan", "models", "providers", "history", "metrics", "quota", "budget", "pool", "rules", "export", "doctor", "mode", "pin", "unpin", "thinking", "feedback"] as const;
+const USAGE = `Usage: /auto-model ${COMMANDS.join("|")}`;
 const POLICIES: RoutingPolicy[] = ["balanced", "best", "cost", "fast"];
 const THINKING: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -149,8 +152,9 @@ export function registerAutoModelCommand(
 	recordEvent?: (event: UnifiedEvent) => void,
 	getRetryCapability?: () => boolean,
 	getPrices?: (ctx: ExtensionCommandContext) => ReadonlyMap<string, ResolvedModelPrice> | undefined,
-	previewRoute?: (prompt: string, ctx: ExtensionCommandContext) => Promise<{ targetId: string; thinking: ThinkingLevel; policy: RoutingPolicy; reason: readonly string[]; utility: number } | undefined>,
+	previewRoute?: (prompt: string, ctx: ExtensionCommandContext) => Promise<{ targetId: string; thinking: ThinkingLevel; policy: RoutingPolicy; reason: readonly string[]; utility: number; ruleTrace?: readonly string[] } | undefined>,
 	savePolicy?: (policy: RoutingPolicy) => Promise<void>,
+	getRules?: (ctx: ExtensionCommandContext) => { rules: readonly RoutingRule[]; diagnostics: readonly string[] },
 ): void {
 	pi.registerCommand("auto-model", {
 		description: "Control and inspect Pi Auto Model",
@@ -202,7 +206,16 @@ export function registerAutoModelCommand(
 				try {
 					const preview = await previewRoute?.(originalRest, ctx);
 					return notify(ctx, preview
-						? `Pi Auto Model Preview\nTarget: ${preview.targetId}\nThinking: ${preview.thinking}\nPolicy: ${preview.policy}\nWhy: ${preview.reason.join(" · ")}\nScore: ${(preview.utility * 100).toFixed(1)} (heuristic)\nNo request was sent.`
+						? [
+							"Pi Auto Model Preview",
+							`Target: ${preview.targetId}`,
+							`Thinking: ${preview.thinking}`,
+							`Policy: ${preview.policy}`,
+							`Why: ${preview.reason.join(" · ")}`,
+							`Score: ${(preview.utility * 100).toFixed(1)} (heuristic)`,
+							...(preview.ruleTrace?.length ? ["Rules:", ...preview.ruleTrace.map((line) => `  ${line}`)] : []),
+							"No request was sent.",
+						].join("\n")
 						: "No eligible model can satisfy this prompt.", preview ? "info" : "warning");
 				} catch {
 					return notify(ctx, "Route preview failed. No request was sent.", "warning");
@@ -323,6 +336,15 @@ export function registerAutoModelCommand(
 						: []),
 				].join("\n"));
 			}
+			if (command === "rules") {
+				const { rules = [], diagnostics = [] } = getRules?.(ctx) ?? {};
+				return notify(ctx, [
+					"Pi Auto Model Rules (first match applies)",
+					...(rules.length ? rules.map((rule, index) => `  ${index + 1}. ${describeRule(rule)}`) : ["  none configured"]),
+					`Last applied: ${current.lastDecision?.ruleName ?? "none"}`,
+					...(diagnostics.length ? ["Configuration issues:", ...diagnostics.map((line) => `  ${line}`)] : []),
+				].join("\n"));
+			}
 			if (command === "export") {
 				const format = rest[0] === "jsonl" ? "jsonl" : "json";
 				if (!exportEvents) return notify(ctx, "Unified event export is unavailable.", "warning");
@@ -380,8 +402,15 @@ export function registerAutoModelCommand(
 						return `  ${diagnostic.id} · auth ${diagnostic.authenticated ? "yes" : "no"} · ${eligibility} · ${capabilities} · circuit ${circuitText} · ${performance ? formatMetrics(performance) : "no metrics"} · ${formatQuotaSignal(quota)}${priceText}`;
 					}).join("\n")
 					: "  none";
+				const ruleState = getRules?.(ctx);
+				const coldReason = coldCacheReason(current);
 				return notify(ctx, [
 					"Pi Auto Model Doctor",
+					...(ruleState?.diagnostics.length
+						? ["Configuration issues:", ...ruleState.diagnostics.map((line) => `  ${line}`)]
+						: ["Configuration issues: none"]),
+					`Rules: ${ruleState?.rules.length ?? 0}`,
+					`Prompt cache: ${coldReason ? `cold (${coldReason}); next task routes fresh` : "warm or unknown"}`,
 					`Activation: ${current.activation}`,
 					`Current model: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none"}`,
 					`Pi scope: ${ctx.scopedModels.length || "all available"}`,
@@ -488,7 +517,7 @@ export function registerAutoModelCommand(
 				}).catch(() => undefined);
 				return notify(ctx, `Pi Auto Model feedback recorded: ${targetId} ${vote} (preference ${preference >= 0 ? "+" : ""}${preference.toFixed(2)}, capped at ±0.10)`);
 			}
-			notify(ctx, "Usage: /auto-model on|off|status|why|plan|models|providers|history|metrics|quota|budget|pool|export|doctor|mode|pin|unpin|thinking|feedback", "warning");
+			notify(ctx, USAGE, "warning");
 		},
 	});
 }

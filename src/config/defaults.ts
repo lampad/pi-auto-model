@@ -6,6 +6,7 @@ import type {
 } from "../types.ts";
 import type { BudgetConfig } from "../budget/budget.ts";
 import type { BenchmarkSource } from "../models/benchmarks.ts";
+import type { RoutingRule, Scenarios } from "../routing/rules.ts";
 
 /** Manual price override for one model (USD per 1M tokens). */
 export interface PriceOverrideConfig {
@@ -61,6 +62,12 @@ export interface AutoModelConfig {
 	costPolicy?: { qualityFloor?: number };
 	/** Price resolution: overrides, multipliers, and the LiteLLM price cache. */
 	pricing?: PricingConfig;
+	/** Shorthand per scenario (task kind, vision, longContext, background); expanded into rules after `rules`. */
+	scenarios?: Scenarios;
+	/** Ordered routing rules; the first matching rule applies. Project rules precede global rules. */
+	rules?: RoutingRule[];
+	/** Configuration problems found while loading (not user-settable). */
+	diagnostics?: string[];
 }
 
 export const DEFAULT_CONFIG: AutoModelConfig = {
@@ -84,4 +91,7 @@ export const DEFAULT_CONFIG: AutoModelConfig = {
 	cacheAware: { enabled: true },
 	shadow: { enabled: false },
 	costPolicy: undefined,
+	scenarios: {},
+	rules: [],
+	diagnostics: [],
 };

@@ -1035,3 +1035,107 @@ test("preview and execution share pool, pin and budget constraints without sendi
 		} finally { f.restore(); }
 	}
 });
+
+function lastRoute(fixture: Awaited<ReturnType<typeof setup>>): string {
+	return routeNotices(fixture).at(-1) ?? "";
+}
+
+test("a matching rule narrows the candidates and is explained", async () => {
+	const f = await setup({ rules: [
+		{ name: "reviews", when: { promptMatches: "^review" }, then: { only: ["anthropic/*"] } },
+	] });
+	try {
+		await begin(f, "hello");
+		assert.match(lastRoute(f), /openai\/gpt-5/);
+		assert.doesNotMatch(lastRoute(f), /rule "/);
+		await f.pi.emit("agent_settled", {}, f.ctx);
+		await f.pi.emit("before_agent_start", { prompt: "Review this diff" }, f.ctx);
+		assert.match(lastRoute(f), /anthropic\/claude-sonnet[\s\S]*Why: rule "reviews"/);
+		await f.pi.commands.get("auto-model")!.handler("rules", f.ctx);
+		const output = f.ctx.notifications.at(-1) ?? "";
+		assert.match(output, /1\. reviews: when promptMatches=\^review → only=anthropic\/\*/);
+		assert.match(output, /Last applied: reviews/);
+	} finally { f.restore(); }
+});
+
+test("a manual pin disables rules", async () => {
+	const f = await setup({ rules: [{ name: "claude", then: { only: ["anthropic/*"] } }] });
+	try {
+		await f.pi.emit("session_start", { type: "session_start", reason: "startup" }, f.ctx);
+		await f.pi.commands.get("auto-model")!.handler("pin openai/gpt-5", f.ctx);
+		await f.pi.emit("before_agent_start", { prompt: "hello" }, f.ctx);
+		assert.match(lastRoute(f), /openai\/gpt-5/);
+		assert.doesNotMatch(lastRoute(f), /rule "/);
+	} finally { f.restore(); }
+});
+
+test("a rule without an eligible model falls back to normal routing and warns once", async () => {
+	const f = await setup({ rules: [{ name: "local-only", then: { only: ["ollama/*"] } }] });
+	const warning = /rule "local-only" matched, but no eligible model satisfies it/;
+	try {
+		await begin(f, "hello");
+		assert.match(lastRoute(f), /openai\/gpt-5[\s\S]*rule "local-only" ignored \(no eligible model\)/);
+		await f.pi.emit("agent_settled", {}, f.ctx);
+		await f.pi.emit("before_agent_start", { prompt: "hello again" }, f.ctx);
+		assert.equal(routeNotices(f).length, 2, "the request is not blocked");
+		assert.equal(f.ctx.notifications.filter((message) => warning.test(message)).length, 1);
+	} finally { f.restore(); }
+});
+
+test("invalid rules are reported at startup and by doctor", async () => {
+	const f = await setup({ rules: [{ name: "broken", then: { policy: "cheapest" } }] });
+	try {
+		await f.pi.emit("session_start", { type: "session_start", reason: "startup" }, f.ctx);
+		assert.ok(f.ctx.notifications.some((message) => /1 configuration issue\(s\)/.test(message)));
+		await f.pi.commands.get("auto-model")!.handler("doctor", f.ctx);
+		const output = f.ctx.notifications.at(-1) ?? "";
+		assert.match(output, /Configuration issues:\n {2}.*rule "broken" ignored: "policy"/);
+		assert.match(output, /Rules: 0/);
+	} finally { f.restore(); }
+});
+
+test("compaction ends warm-target stickiness for the next task only", async () => {
+	const f = await setup();
+	f.ctx.contextTokens = 80_000;
+	try {
+		await begin(f, "@model:anthropic/claude-sonnet hello");
+		await f.pi.emit("agent_settled", {}, f.ctx);
+		await f.pi.emit("session_compact", { type: "session_compact", reason: "threshold", compactionEntry: {}, fromExtension: false }, f.ctx);
+		await f.pi.commands.get("auto-model")!.handler("doctor", f.ctx);
+		assert.match(f.ctx.notifications.at(-1) ?? "", /Prompt cache: cold \(compaction\); next task routes fresh/);
+		await f.pi.emit("before_agent_start", { prompt: "hello" }, f.ctx);
+		assert.match(lastRoute(f), /openai\/gpt-5[\s\S]*cache cold \(compaction\)/);
+		await f.pi.commands.get("auto-model")!.handler("doctor", f.ctx);
+		assert.match(f.ctx.notifications.at(-1) ?? "", /Prompt cache: warm or unknown/);
+	} finally { f.restore(); }
+});
+
+test("a long idle gap ends warm-target stickiness", async () => {
+	const f = await setup();
+	f.ctx.contextTokens = 80_000;
+	const realNow = Date.now;
+	try {
+		await begin(f, "@model:anthropic/claude-sonnet hello");
+		await f.pi.emit("agent_settled", {}, f.ctx);
+		const settledAt = realNow();
+		Date.now = () => settledAt + 6 * 60_000;
+		await f.pi.emit("before_agent_start", { prompt: "hello" }, f.ctx);
+		assert.match(lastRoute(f), /openai\/gpt-5[\s\S]*cache cold \(idle 6m\)/);
+	} finally { Date.now = realNow; f.restore(); }
+});
+
+test("a scenario shorthand routes a task kind and the plan preview shows the rule trace", async () => {
+	const f = await setup({ scenarios: { vision: "best", review: "anthropic/*" } });
+	const prompt = "Review this pull request and point out bugs";
+	try {
+		await f.pi.emit("session_start", { type: "session_start", reason: "startup" }, f.ctx);
+		await f.pi.commands.get("auto-model")!.handler(`plan ${prompt}`, f.ctx);
+		const preview = f.ctx.notifications.at(-1) ?? "";
+		assert.match(preview, /Target: anthropic\/claude-sonnet/);
+		assert.match(preview, /Rules:\n {2}✗ scenario:vision: task has no images\n {2}✓ scenario:review/);
+		await f.pi.emit("before_agent_start", { prompt }, f.ctx);
+		assert.match(lastRoute(f), /anthropic\/claude-sonnet[\s\S]*rule "scenario:review"/);
+		await f.pi.commands.get("auto-model")!.handler("plan hello", f.ctx);
+		assert.match(f.ctx.notifications.at(-1) ?? "", /✗ scenario:review: task is/);
+	} finally { f.restore(); }
+});

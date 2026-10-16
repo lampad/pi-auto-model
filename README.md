@@ -166,6 +166,7 @@ All commands use the `/auto-model` namespace.
 | `/auto-model pool` | Show the active pool and configured pools |
 | `/auto-model pool <name>` | Use a configured weighted pool for this session |
 | `/auto-model pool off` | Clear the session pool override |
+| `/auto-model rules` | List active scenarios and rules, the last applied one, and configuration issues |
 | `/auto-model export [json|jsonl]` | Export the local unified event history |
 | `/auto-model doctor` | Diagnose candidates, authentication, capabilities, circuits, and feedback |
 | `/auto-model mode balanced` | Balance capability, cost, and target stickiness |
@@ -197,6 +198,8 @@ Run:
 
 Doctor reports:
 
+- Configuration issues (unreadable files, invalid JSON, invalid fields, ignored scenarios or rules).
+- Number of active scenarios and rules, and whether the prompt cache is cold (after compaction or a long idle gap).
 - Current activation state and current model.
 - Pi model scope.
 - Current context usage.
@@ -231,7 +234,7 @@ When the project is trusted by Pi, it also reads:
 <project>/.pi/auto-model.json
 ```
 
-The project configuration is merged over the global configuration. Invalid or unreadable configuration fails open and does not prevent Pi from starting.
+The project configuration is merged over the global configuration. Invalid or unreadable configuration fails open and does not prevent Pi from starting. Pi Auto Model shows a startup warning when a file was ignored or a rule was dropped; run `/auto-model doctor` for the details.
 
 Example:
 
@@ -310,6 +313,10 @@ Example:
   },
   "shadow": {
     "enabled": false
+  },
+  "scenarios": {
+    "review": "anthropic/*",
+    "background": "cost"
   },
   "costPolicy": {
     "qualityFloor": 0
@@ -532,6 +539,84 @@ Controls prompt-cache-aware stickiness economics.
 
 - `enabled` (default `false`): compute and record the automatic choice while keeping the current concrete model. This supports low-risk routing evaluation before enabling automatic mode. Pins remain authoritative, and hard context, output, vision, health, quota, and budget rules still apply.
 
+#### `scenarios`
+
+Automatic routing needs no rules. Use `scenarios` only when you have a specific preference for one kind of work. Each entry is one line:
+
+```json
+{
+  "scenarios": {
+    "review": "anthropic/*",
+    "background": "cost",
+    "vision": "openai/gpt-5",
+    "plan": { "policy": "best", "thinking": "high" }
+  }
+}
+```
+
+A value can be:
+
+- a policy name (`balanced`, `best`, `cost`, `fast`) to use for that scenario;
+- a model pattern or a list of patterns (`"anthropic/*"`, `["openai/gpt-5", "anthropic/*"]`) to use only those models;
+- an action object (see the actions table under `rules`) for anything more specific.
+
+Scenario names:
+
+| Name | Applies when |
+| --- | --- |
+| `vision` | The task includes images |
+| `longContext` | The context is at least 100,000 tokens |
+| `background` | The turn was started by an extension (for example, a subagent result) rather than by you |
+| `explain`, `code-edit`, `generate`, `debug`, `refactor`, `review`, `test`, `plan`, `architecture`, `ops`, `research` | The analyzed task has this kind |
+
+`vision`, `longContext`, and `background` are checked first, then task kinds in the order you list them. Project scenarios replace global scenarios with the same name. A misspelled name is reported with a suggestion (for example, `did you mean "review"?`).
+
+Run `/auto-model plan <prompt>` to check which scenario would apply; the preview lists each scenario or rule that was checked and why it did or did not match.
+
+#### `rules`
+
+Rules are the advanced form of `scenarios`, for conditions a scenario name cannot express. They are checked before scenarios, in order, and the **first matching rule** applies. Project rules are checked before global rules.
+
+```json
+{
+  "rules": [
+    {
+      "name": "urgent-hotfix",
+      "when": { "promptMatches": "hotfix|prod(uction)? down", "kinds": "debug" },
+      "then": { "policy": "best", "minimumTier": "strong" }
+    }
+  ]
+}
+```
+
+Each rule has a `name`, an optional `when` (all listed conditions must hold; a missing `when` always matches), and a `then` with at least one action. Wherever a list is accepted, a single string works too.
+
+Conditions (`when`):
+
+| Field | Matches when |
+| --- | --- |
+| `kinds` | The task has any of these kinds (see the scenario names above, plus `mixed`) |
+| `minComplexity` / `maxComplexity` | The analyzed complexity (0–1) is within the bounds |
+| `minContextTokens` / `maxContextTokens` | The current context size is within the bounds |
+| `hasImages` | The task does (`true`) or does not (`false`) include images |
+| `trigger` | `user` for a user prompt, `extension` for a turn started by an extension |
+| `promptMatches` | The prompt matches this case-insensitive regular expression |
+
+Actions (`then`, also usable as a scenario value):
+
+| Field | Effect |
+| --- | --- |
+| `only` | Keep only targets matching these patterns (`provider/model`, bare model id, `*` wildcards) |
+| `exclude` | Remove targets matching these patterns |
+| `minimumTier` | Keep only targets at or above `light`, `mid`, `strong`, or `frontier` |
+| `prefer` | Give matching targets a scoring bonus without excluding others |
+| `policy` | Use `balanced`, `best`, `cost`, or `fast` for this task |
+| `thinking` | Use this thinking level (a `/auto-model thinking fixed` or `pi` setting still wins) |
+
+Scenarios and rules never bypass hard limits: context, output, vision, circuit, quota, and budget checks still apply. They are skipped while a manual pin or an inline prefix pin is active. If the models they allow are all unavailable, they are ignored for that task, normal routing is used, and a warning is shown once per session.
+
+An invalid scenario or rule is dropped on its own; everything else in the file still loads. The applied scenario or rule appears in the route notice and `/auto-model why`, and `/auto-model rules` lists everything that is active.
+
 ## Model scope
 
 Pi Auto Model only considers models that:
@@ -565,11 +650,12 @@ Before a task starts, Pi Auto Model:
 6. Avoids quota-blocked or rate-limited Providers when another eligible Provider exists.
 7. Filters context, output, and vision incompatibilities.
 8. Restricts candidates to the configured pool when one is active.
-9. Scores capability (benchmark-backed or catalog prior), cost, latency, reliability learning, cache-aware stickiness, quota pressure, pool fairness, policy, and feedback.
-10. Selects a thinking level.
-11. Stores the ranked target list for the stream proxy. The model stays as `pi-auto-model/auto`; the proxy calls the real provider's `streamSimple` internally and fails over to the next ranked target when an error occurs before substantive output.
+9. Applies the first matching rule or scenario (if any are configured): model filters, preferences, policy, and thinking.
+10. Scores capability (benchmark-backed or catalog prior), cost, latency, reliability learning, cache-aware stickiness, quota pressure, pool fairness, policy, and feedback.
+11. Selects a thinking level.
+12. Stores the ranked target list for the stream proxy. The model stays as `pi-auto-model/auto`; the proxy calls the real provider's `streamSimple` internally and fails over to the next ranked target when an error occurs before substantive output.
 
-Manual target pins take precedence over pool membership and prefix pins. The pool only influences automatic selection and uses local hourly target-attempt counts, so no request content leaves the machine.
+Manual target pins take precedence over prefix pins, routing rules, and pool membership. The pool only influences automatic selection and uses local hourly target-attempt counts, so no request content leaves the machine.
 
 ### Cache-aware stickiness
 
@@ -580,6 +666,13 @@ When `cacheAware.enabled` is `true` (default), the router quantifies the economi
 - **Switching to a more capable model** (upgrade) pays no penalty, so capability upgrades are never blocked by cache economics.
 
 This avoids cache-invalidating switches on every turn while still allowing necessary upgrades.
+
+Stickiness only pays off while the prompt cache is warm. The router treats the cache as cold, and routes the next task fresh without stickiness, when:
+
+- Pi compacted the session (the conversation was rewritten), or
+- the session was idle for more than 5 minutes (a common provider cache lifetime).
+
+The route notice then shows the reason, for example `cache cold (compaction)` or `cache cold (idle 12m)`. A compaction in the middle of a task never changes that task's model; it only affects the next task. This needs no configuration.
 
 ### Same-request failover
 

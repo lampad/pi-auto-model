@@ -5,15 +5,42 @@ import {
 	type AutoModelConfig,
 } from "./defaults.ts";
 import { normalizeRoutingPolicy } from "../types.ts";
+import { parseRules, parseScenarios } from "../routing/rules.ts";
 
+/**
+ * `rules` and `diagnostics` contain only this file's entries, never the
+ * fallback's, so `mergeConfig` can concatenate them without duplicates.
+ */
 export async function loadConfig(
 	path: string,
 	fallback: AutoModelConfig = DEFAULT_CONFIG,
 ): Promise<AutoModelConfig> {
+	const diagnostics: string[] = [];
 	try {
-		const value: unknown = JSON.parse(await readFile(path, "utf8"));
-		if (!isValidConfig(value)) throw new Error("invalid auto-model config");
+		let text: string;
+		try {
+			text = await readFile(path, "utf8");
+		} catch (error) {
+			if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) {
+				diagnostics.push(`${path}: unreadable; using defaults`);
+			}
+			throw error;
+		}
+		let value: unknown;
+		try {
+			value = JSON.parse(text);
+		} catch (error) {
+			diagnostics.push(`${path}: invalid JSON; using defaults`);
+			throw error;
+		}
+		if (!isValidConfig(value)) {
+			diagnostics.push(`${path}: invalid configuration; using defaults`);
+			throw new Error("invalid auto-model config");
+		}
 		const parsed = value;
+		const rules = parseRules((value as Record<string, unknown>).rules, path);
+		const scenarios = parseScenarios((value as Record<string, unknown>).scenarios, path);
+		diagnostics.push(...scenarios.errors, ...rules.errors);
 		return {
 			...fallback,
 			...parsed,
@@ -40,6 +67,9 @@ export async function loadConfig(
 			shadow: { enabled: parsed.shadow?.enabled ?? fallback.shadow?.enabled ?? false },
 			costPolicy: parsed.costPolicy ?? fallback.costPolicy,
 			pricing: parsed.pricing ?? fallback.pricing,
+			scenarios: scenarios.scenarios,
+			rules: rules.rules,
+			diagnostics,
 		};
 	} catch {
 		return {
@@ -64,6 +94,9 @@ export async function loadConfig(
 			shadow: { enabled: fallback.shadow?.enabled ?? false },
 			costPolicy: fallback.costPolicy,
 			pricing: fallback.pricing,
+			scenarios: {},
+			rules: [],
+			diagnostics,
 		};
 	}
 }
@@ -110,6 +143,9 @@ export function mergeConfig(base: AutoModelConfig, override: AutoModelConfig): A
 		shadow: { enabled: override.shadow?.enabled ?? base.shadow?.enabled ?? false },
 		costPolicy: override.costPolicy ?? base.costPolicy,
 		pricing: mergePricing(base.pricing, override.pricing),
+		scenarios: { ...base.scenarios, ...override.scenarios },
+		rules: [...(override.rules ?? []), ...(base.rules ?? [])],
+		diagnostics: [...(base.diagnostics ?? []), ...(override.diagnostics ?? [])],
 	};
 }
 

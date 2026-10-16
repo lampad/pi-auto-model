@@ -115,6 +115,8 @@ export interface RecordedDecision {
 	score: RouteScore;
 	taskKinds: TaskKind[];
 	createdAt: number;
+	/** Scenario rule that shaped this decision, when one applied. */
+	ruleName?: string;
 }
 export interface TaskProfile {
 	taskId: string;
@@ -352,6 +354,10 @@ export interface SessionRuntimeState {
 	decisionHistory: RecordedDecision[];
 	feedbackPreferences: Record<string, number>;
 	initialPromptHandled: boolean;
+	/** Set when the prompt cache was invalidated (e.g. by compaction); consumed by the next route. */
+	cacheBoundary?: { at: number; reason: string };
+	/** When the previous task settled; long idle gaps mean the prompt cache has expired. */
+	lastTaskEndedAt?: number;
 	createdAt: number;
 	updatedAt: number;
 	lock: import("./pi/session-lock.ts").SessionLock;

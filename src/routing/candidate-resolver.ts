@@ -11,7 +11,7 @@ export interface CandidateModel {
 	authenticated: boolean;
 }
 
-function matchesPattern(value: string, pattern: string): boolean {
+export function matchesPattern(value: string, pattern: string): boolean {
 	const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&");
 	const expression = new RegExp(`^${escaped.replaceAll("*", ".*")}$`, "i");
 	return expression.test(value);

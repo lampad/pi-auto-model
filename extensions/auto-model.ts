@@ -13,6 +13,7 @@ import type {
 	SessionShutdownEvent,
 	SessionBeforeForkEvent,
 	SessionBeforeSwitchEvent,
+	SessionCompactEvent,
 	SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
@@ -48,6 +49,17 @@ import { RuntimeStateStore } from "../src/pi/runtime-store.ts";
 import { planRoute, hardConstraintFailure, isInPool } from "../src/routing/route-planner.ts";
 import { requestContextTokens } from "../src/pi/request-context.ts";
 import { chooseFailoverTarget } from "../src/routing/failover.ts";
+import {
+	effectiveRules,
+	filterTargetsByRule,
+	hasRuleFilters,
+	matchRule,
+	preferredTargetIds,
+	traceRules,
+	type RoutingRule,
+	type RuleFacts,
+} from "../src/routing/rules.ts";
+import { coldCacheReason } from "../src/routing/cache-state.ts";
 import { chooseThinkingLevel } from "../src/routing/thinking-router.ts";
 import { CircuitBreaker } from "../src/health/circuit-breaker.ts";
 import { DEFAULT_CONFIG, type AutoModelConfig } from "../src/config/defaults.ts";
@@ -121,7 +133,7 @@ import {
  *   the fail-safe fallback so the user's request still succeeds.
  */
 type AutoRouteOutcome =
-	| { status: "routed"; plan?: RoutePlan }
+	| { status: "routed"; plan?: RoutePlan; ruleTrace?: string[] }
 	| { status: "blocked" }
 	| { status: "failed" };
 
@@ -246,6 +258,8 @@ export default function autoModel(pi: ExtensionAPI): void {
 	// Runs started without before_agent_start, waiting for their first context
 	// event to see the triggering message.
 	const runAwaitingRoute = new Set<string>();
+	// Rules already reported as unusable, per session, so each is reported once.
+	const ignoredRuleNotices = new Map<string, Set<string>>();
 	let modelRegistry: ModelRegistry | undefined;
 	const pendingFor = (sessionId?: string): PendingStreamRequest | undefined => {
 		if (sessionId) return pendingStreams.get(sessionId);
@@ -504,10 +518,14 @@ export default function autoModel(pi: ExtensionAPI): void {
 			const plan = outcome.status === "routed" ? outcome.plan : undefined;
 			return plan && { targetId: plan.target.id, thinking: plan.thinking, policy: plan.policy,
 				reason: [...plan.reason, ...(config.classifier.enabled ? ["local preview; live classifier may refine this route"] : [])],
-				utility: plan.score.utility };
+				utility: plan.score.utility, ruleTrace: outcome.status === "routed" ? outcome.ruleTrace : undefined };
 
 		},
 		(policy) => saveConfigPolicy(configPath, policy),
+		(ctx) => {
+			const config = configs.get(ctx.sessionManager.getSessionId()) ?? DEFAULT_CONFIG;
+			return { rules: effectiveRules(config), diagnostics: config.diagnostics ?? [] };
+		},
 	);
 
 	pi.on(
@@ -539,6 +557,9 @@ export default function autoModel(pi: ExtensionAPI): void {
 			state.routingPool = config.pool;
 			if (config.pool && !config.pools[config.pool]) {
 				ctx.ui.notify(`Pi Auto Model: configured pool "${config.pool}" was not found. Using all eligible models.`, "warning");
+			}
+			if (config.diagnostics?.length) {
+				ctx.ui.notify(`Pi Auto Model: ${config.diagnostics.length} configuration issue(s). Run /auto-model doctor for details.`, "warning");
 			}
 			if (config.enabled) {
 				const preserveForkActivation = _event.reason === "fork";
@@ -635,7 +656,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 		// policy stops must never be converted into dispatch permission.
 		let outcome: AutoRouteOutcome;
 		try {
-			outcome = await applyAutoRoute(_event, ctx, state, config, requestId, allowPrefix);
+			outcome = await applyAutoRoute(_event, ctx, state, config, requestId, allowPrefix, false, fromUserPrompt ? "user" : "extension");
 		} catch (error) {
 			recordRouterFailure(state.sessionId);
 			notifySafe(ctx, `Pi Auto Model routing failed (${errorMessage(error)}). Falling back to a working model.`);
@@ -667,6 +688,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 		requestId: string,
 		allowPrefix: boolean,
 		preview = false,
+		trigger: "user" | "extension" = "user",
 	): Promise<AutoRouteOutcome> {
 			const activeFailure = state.activeTask?.lastFailure && state.activeTask.routeTargetId
 				? {
@@ -824,13 +846,34 @@ export default function autoModel(pi: ExtensionAPI): void {
 				return { status: "blocked" };
 			}
 
-			const defaultPlan = planRoute({
-				outputTokenLimit: AUTO_MODEL_MAX_TOKENS,
-				targets: routeTargets,
-				profile,
-				currentTargetId: currentRouteId(state, ctx),
+			// Once the prompt cache is gone (compaction or idle expiry), staying on
+			// the current target no longer saves anything.
+			const coldReason = coldCacheReason(state);
+			const coldCache = coldReason !== undefined;
+			const stickyTargetId = coldCache ? undefined : currentRouteId(state, ctx);
+			const capabilityOptions = { source: config.capabilitySource, overrides: config.benchmarkOverrides };
+			const rulesDisabled = Boolean(state.manualOverrides.pinnedTargetId || prefixPinnedTarget || prefixPin.mode);
+			const rules = rulesDisabled ? [] : effectiveRules(config);
+			const ruleFacts: RuleFacts = {
+				kinds: profile.kinds,
+				complexity: profile.complexity,
 				contextTokens: contextTokensOf(ctx),
-				policy: state.manualOverrides.policy ?? config.policy,
+				hasImages: profile.constraints.requiresVision,
+				trigger,
+				prompt: effectivePrompt,
+			};
+			const matchedRule = matchRule(rules, ruleFacts);
+			let activeRule: RoutingRule | undefined = matchedRule;
+			let ruleTargets = matchedRule && hasRuleFilters(matchedRule)
+				? filterTargetsByRule(routeTargets, matchedRule, capabilityOptions)
+				: routeTargets;
+			const planDefault = (targets: readonly RouteTarget[], rule: RoutingRule | undefined) => planRoute({
+				outputTokenLimit: AUTO_MODEL_MAX_TOKENS,
+				targets,
+				profile,
+				currentTargetId: stickyTargetId,
+				contextTokens: contextTokensOf(ctx),
+				policy: rule?.then.policy ?? state.manualOverrides.policy ?? config.policy,
 				quota: quotaSignals,
 				pool: activePool,
 				poolAttempts,
@@ -838,10 +881,27 @@ export default function autoModel(pi: ExtensionAPI): void {
 				quality: qualitySignals,
 				costMultipliers,
 				prices,
-				cacheAware: config.cacheAware?.enabled !== false,
+				cacheAware: !coldCache && config.cacheAware?.enabled !== false,
 				costQualityFloor: config.costPolicy?.qualityFloor,
-				capabilityOptions: { source: config.capabilitySource, overrides: config.benchmarkOverrides },
+				capabilityOptions,
+				preferredTargetIds: preferredTargetIds(targets, rule),
 			});
+			let defaultPlan = ruleTargets.length > 0 ? planDefault(ruleTargets, activeRule) : undefined;
+			let ignoredRule: RoutingRule | undefined;
+			if (!defaultPlan && matchedRule && ruleTargets !== routeTargets) {
+				// A rule narrows the choice but must never be the reason a request is blocked.
+				ignoredRule = matchedRule;
+				activeRule = undefined;
+				ruleTargets = routeTargets;
+				defaultPlan = planDefault(routeTargets, undefined);
+				const shown = ignoredRuleNotices.get(state.sessionId) ?? new Set<string>();
+				if (!preview && !shown.has(matchedRule.name)) {
+					shown.add(matchedRule.name);
+					ignoredRuleNotices.set(state.sessionId, shown);
+					notifySafe(ctx, `Pi Auto Model: rule "${matchedRule.name}" matched, but no eligible model satisfies it. Using normal routing.`, "warning");
+				}
+			}
+			const routePolicy = activeRule?.then.policy ?? state.manualOverrides.policy ?? config.policy;
 			const retryTarget = previousFailure
 				? chooseFailoverTarget(
 						defaultPlan?.rankedTargets ?? [],
@@ -916,7 +976,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 					targets: [current],
 					profile,
 					contextTokens: contextTokensOf(ctx),
-					policy: state.manualOverrides.policy ?? config.policy,
+					policy: routePolicy,
 					costMultipliers,
 					prices,
 					costQualityFloor: config.costPolicy?.qualityFloor,
@@ -946,13 +1006,13 @@ export default function autoModel(pi: ExtensionAPI): void {
 			);
 			if ((budgetDecision.action === "downgrade" || budgetDecision.action === "avoid") && !pinnedPlan) {
 				const budgetTargets = budgetDecision.action === "avoid"
-					? routeTargets.filter((target) => target.model.provider !== effectivePlan.target.model.provider)
-					: routeTargets;
+					? ruleTargets.filter((target) => target.model.provider !== effectivePlan.target.model.provider)
+					: ruleTargets;
 				const cheaperPlan = planRoute({
 					outputTokenLimit: AUTO_MODEL_MAX_TOKENS,
 					targets: budgetTargets,
 					profile,
-					currentTargetId: currentRouteId(state, ctx),
+					currentTargetId: stickyTargetId,
 					contextTokens: contextTokensOf(ctx),
 					policy: "cost",
 					quota: quotaSignals,
@@ -992,13 +1052,26 @@ export default function autoModel(pi: ExtensionAPI): void {
 				// Intentional user-configured stop: do not route around it.
 				return { status: "blocked" };
 			}
+			if (!pinnedPlan) {
+				const routeTags = [
+					...(activeRule ? [`rule "${activeRule.name}"`] : []),
+					...(ignoredRule ? [`rule "${ignoredRule.name}" ignored (no eligible model)`] : []),
+					...(coldReason ? [`cache cold (${coldReason})`] : []),
+				];
+				if (routeTags.length) effectivePlan = { ...effectivePlan, reason: [...routeTags, ...effectivePlan.reason] };
+			}
 			const thinking = state.manualOverrides.thinkingMode === "fixed"
 				? state.manualOverrides.fixedThinking ?? effectivePlan.thinking
 				: state.manualOverrides.thinkingMode === "pi"
 					? ctx.thinkingLevel ?? effectivePlan.thinking
-					: effectivePlan.thinking;
+					: activeRule?.then.thinking ?? effectivePlan.thinking;
 
-			if (preview) return { status: "routed", plan: { ...effectivePlan, thinking } };
+			if (preview) {
+				const ruleTrace = rulesDisabled
+					? ["rules skipped while a pin is active"]
+					: [...traceRules(rules, ruleFacts), ...(ignoredRule ? [`${ignoredRule.name} ignored: no eligible model`] : [])];
+				return { status: "routed", plan: { ...effectivePlan, thinking }, ruleTrace };
+			}
 
 			// Store the ranked target list for the streamSimple proxy.
 			// The model stays as pi-auto-model/auto; the proxy will call
@@ -1045,6 +1118,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 
 			const now = Date.now();
 			state.lastFailedRoute = undefined;
+			state.cacheBoundary = undefined;
 			state.activeTask = {
 				requestId,
 				startedAt: now,
@@ -1076,6 +1150,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 				score: effectivePlan.score,
 				taskKinds: profile.kinds,
 				createdAt: now,
+				ruleName: activeRule?.name,
 			});
 			events.record({
 				id: `route-${requestId}`,
@@ -1093,6 +1168,9 @@ export default function autoModel(pi: ExtensionAPI): void {
 					utility: effectivePlan.score.utility,
 					budgetAction: budgetDecision.action,
 					shadowTargetId,
+					ruleName: activeRule?.name,
+					ignoredRuleName: ignoredRule?.name,
+					cacheCold: coldReason,
 				},
 			});
 			events.record({
@@ -1406,6 +1484,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 			);
 		}
 		state.activeTask = undefined;
+		state.lastTaskEndedAt = Date.now();
 		pendingStreams.delete(state.sessionId);
 		state.updatedAt = Date.now();
 		updateAutoModelStatus(ctx, state);
@@ -1558,6 +1637,14 @@ export default function autoModel(pi: ExtensionAPI): void {
 		},
 	);
 
+	// Older Pi versions never emit this event; routing then keeps cache stickiness.
+	pi.on("session_compact", safeHandler<SessionCompactEvent>("session_compact", (event, ctx) => {
+		if (!contextIsCompatible(ctx)) return;
+		const state = store.get(ctx.sessionManager.getSessionId());
+		if (state?.activation !== "active") return;
+		state.cacheBoundary = { at: Date.now(), reason: "compaction" };
+	}));
+
 	pi.on(
 		"session_before_fork",
 		safeHandler<SessionBeforeForkEvent>("session_before_fork", (event, ctx) => {
@@ -1589,6 +1676,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 			routerHealth.delete(ctx.sessionManager.getSessionId());
 			runRouted.delete(ctx.sessionManager.getSessionId());
 			runAwaitingRoute.delete(ctx.sessionManager.getSessionId());
+			ignoredRuleNotices.delete(ctx.sessionManager.getSessionId());
 		}),
 	);
 }
