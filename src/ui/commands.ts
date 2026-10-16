@@ -30,7 +30,7 @@ import { coldCacheReason } from "../routing/cache-state.ts";
 
 const FEEDBACK_LOG = join(homedir(), ".pi", "agent", "auto-model", "feedback.jsonl");
 
-const COMMANDS = ["on", "off", "status", "why", "plan", "models", "providers", "history", "metrics", "quota", "budget", "pool", "rules", "export", "doctor", "mode", "pin", "unpin", "thinking", "feedback"] as const;
+const COMMANDS = ["on", "off", "status", "why", "task", "outcome", "plan", "models", "providers", "history", "metrics", "quota", "budget", "pool", "rules", "export", "doctor", "mode", "pin", "unpin", "thinking", "feedback"] as const;
 const USAGE = `Usage: /auto-model ${COMMANDS.join("|")}`;
 const POLICIES: RoutingPolicy[] = ["balanced", "best", "cost", "fast"];
 const THINKING: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -110,6 +110,8 @@ function completions(prefix: string): CompletionItem[] | null {
 			return withCommandPrefix("thinking", THINKING_MODE_OPTIONS, valuePrefix);
 		case "feedback":
 			return withCommandPrefix("feedback", FEEDBACK_OPTIONS, valuePrefix);
+		case "outcome":
+			return withCommandPrefix("outcome", ["success", "failure", "unknown"].map((value) => ({ value, label: value })), valuePrefix);
 		case "export":
 			return withCommandPrefix("export", EXPORT_OPTIONS, valuePrefix);
 		case "pool":
@@ -200,6 +202,28 @@ export function registerAutoModelCommand(
 				return notify(ctx, decision
 					? `Pi Auto Model Decision\nTarget: ${decision.targetId}\nThinking: ${decision.thinking}\nPolicy: ${decision.policy}\nWhy: ${decision.reason.join(" · ")}\nScore: ${(decision.score.utility * 100).toFixed(1)} (heuristic)`
 					: "No Pi Auto Model decision exists in this session yet.");
+			}
+			if (command === "task" || command === "outcome") {
+				const sessionEvents = (getEvents?.(ctx) ?? []).filter((event) => event.sessionId === current.sessionId);
+				const summary = sessionEvents.filter((event) => event.kind === "task_summary").at(-1);
+				if (current.activeTask) return notify(ctx, `Task still running. Reserved/reconciled so far: $${(current.activeTask.budgetSpentUsd ?? 0).toFixed(4)}. Inspect or label its result after it settles.`);
+				if (!summary) return notify(ctx, "No completed automatic task recorded in this session yet.");
+				if (command === "outcome") {
+					if (rest.length !== 1 || !["success", "failure", "unknown"].includes(rest[0])) return notify(ctx, "Usage: /auto-model outcome success|failure|unknown", "warning");
+					recordEvent?.({ id: `outcome-${summary.requestId}-${Date.now()}`, kind: "task_outcome",
+						requestId: summary.requestId, sessionId: current.sessionId, at: Date.now(),
+						metadata: { outcome: rest[0], evidence: "user" } });
+					return notify(ctx, `Task ${summary.requestId}: ${rest[0]} (user assessment).`);
+				}
+				const assessment = sessionEvents.filter((event) => event.kind === "task_outcome" && event.requestId === summary.requestId).at(-1);
+				return notify(ctx, ["Pi Auto Model Task", `Request: ${summary.requestId}`,
+					`Outcome: ${assessment?.metadata?.outcome ?? summary.metadata?.outcome ?? "unknown"}${assessment ? " (user assessment)" : " (not independently validated)"}`,
+					`Cost: $${(summary.costUsd ?? 0).toFixed(4)} (${summary.metadata?.costBasis ?? "estimated"}; includes failed attempts and auxiliary calls during this task)`,
+					`Duration: ${summary.latencyMs ?? 0} ms · Attempts: ${summary.metadata?.attempts ?? 0}`,
+					`Final target: ${summary.targetId ?? "unknown"}`,
+					`Escalation: ${summary.metadata?.escalationReason ?? "none"}`,
+					"Use /auto-model outcome success|failure|unknown after checking the task result.",
+				].join("\n"));
 			}
 			if (command === "plan") {
 				if (!originalRest) return notify(ctx, "Usage: /auto-model plan <prompt>", "warning");

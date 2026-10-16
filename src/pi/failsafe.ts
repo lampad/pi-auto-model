@@ -8,6 +8,7 @@ import { planRoute } from "../routing/route-planner.ts";
 import type { PendingStreamRequest } from "./stream-proxy.ts";
 import { resolvePiCandidates } from "./registry-adapter.ts";
 import type { CapabilityTier } from "../types.ts";
+import type { ResolvedModelPrice } from "../pricing/price-catalog.ts";
 
 /**
  * Fail-safe routing.
@@ -37,6 +38,7 @@ export interface FallbackPendingArgs {
 	excludedProviders?: readonly string[];
 	pinnedTargetId?: string;
 	minimumTier?: CapabilityTier;
+	prices?: ReadonlyMap<string, ResolvedModelPrice>;
 }
 
 /**
@@ -74,11 +76,13 @@ export function buildFallbackPending(args: FallbackPendingArgs): PendingStreamRe
 		profile,
 		contextTokens: args.contextTokens,
 		policy: "balanced",
+		prices: args.prices,
 		capabilityOptions: { source: args.config.capabilitySource, overrides: args.config.benchmarkOverrides },
 	});
 	if (!route && pool?.fallback === "any") route = planRoute({
 		outputTokenLimit: AUTO_MODEL_MAX_TOKENS,
 		targets, profile, contextTokens: args.contextTokens,
+		prices: args.prices,
 		capabilityOptions: { source: args.config.capabilitySource, overrides: args.config.benchmarkOverrides },
 	});
 	if (!route) return undefined;
@@ -104,9 +108,11 @@ export function buildFallbackPending(args: FallbackPendingArgs): PendingStreamRe
 		profile,
 		requestId: args.requestId,
 		sessionId: args.sessionId,
-		estimatedCostUsd: estimateCost(first, args.contextTokens, profile),
+		estimatedCostUsd: estimateCost(first, args.contextTokens, profile, args.prices?.get(first.id)),
 		apisUsed: args.apisUsed,
 		prefixToStrip: args.prefixToStrip,
 		firstOutputTimeoutMs: args.config.failover?.firstOutputTimeoutMs,
+		maxAttempts: args.config.failover.maxAttempts,
+		requestTimeoutMs: args.config.failover.requestTimeoutMs,
 	};
 }

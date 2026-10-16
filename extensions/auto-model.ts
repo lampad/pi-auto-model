@@ -33,13 +33,13 @@ import {
 	type AttemptResult,
 } from "../src/pi/stream-proxy.ts";
 import {
-	forceSettleStaleTask,
 	handleModelSelect,
 	settlePendingActivation,
 	setActivation,
 	stateForContext,
 } from "../src/pi/activation.ts";
 import { handleBeforeCompact } from "../src/pi/compaction.ts";
+import { classifyToolFailure } from "../src/task/tool-failure.ts";
 import { handleBeforeFork, handleSessionStart } from "../src/pi/fork.ts";
 import {
 	formatCandidateFailure,
@@ -319,6 +319,12 @@ export default function autoModel(pi: ExtensionAPI): void {
 		getRegistry: () => modelRegistry,
 		circuits,
 		getPendingStream: pendingFor,
+		onRequestStopped: (request, timedOut) => {
+			const task = store.get(request.sessionId)?.activeTask;
+			if (task?.requestId !== request.requestId) return;
+			task.finalAttemptSuccess = false;
+			task.finalAttemptAborted = !timedOut;
+		},
 		beforeAttempt: async (target, request, context) => {
 			const state = store.get(request.sessionId);
 			if (!state?.activeTask || !request.attemptId) return "missing active task or dispatch identity";
@@ -334,18 +340,21 @@ export default function autoModel(pi: ExtensionAPI): void {
 				} };
 				const failure = hardConstraintFailure(target, profile, inputTokens, { source: config.capabilitySource, overrides: config.benchmarkOverrides });
 				if (failure) return failure;
-				const estimate = estimateCost(target, inputTokens, profile);
+				const prices = resolvePrices(config, request.targets);
+				const estimate = estimateCost(target, inputTokens, profile, prices.get(target.id));
 				const limits = { ...config.budget, maxUsdPerTask: config.budget.maxUsdPerTask === undefined
 					? undefined : Math.max(0, config.budget.maxUsdPerTask - (task.budgetSpentUsd ?? 0)) };
 				const initial = budgetLedger.evaluate(estimate, target.model.provider, limits, Date.now(), state.sessionId);
 				if (initial.action === "block" || initial.action === "avoid") return `budget ${initial.action}: ${initial.exceeded.join(", ")}`;
 				if (initial.action === "downgrade" && request.targets.some((candidate) =>
-					candidate.id !== target.id && estimateCost(candidate, inputTokens, profile) < estimate)) return "budget requires a cheaper route";
+					candidate.id !== target.id && estimateCost(candidate, inputTokens, profile, prices.get(candidate.id)) < estimate)) return "budget requires a cheaper route";
 				const at = Date.now();
 				const decision = await budgetLedger.reserve(target.model.provider, estimate, limits, at, state.sessionId);
 				if (decision.action === "block" || decision.action === "avoid") return `budget reservation ${decision.action}: ${decision.exceeded.join(", ")}`;
 				reservations.set(request.attemptId!, { provider: target.model.provider, estimate, at, sessionId: state.sessionId });
 				task.budgetSpentUsd = (task.budgetSpentUsd ?? 0) + estimate;
+				task.attemptCount = (task.attemptCount ?? 0) + 1;
+				task.unknownCostAttempts = (task.unknownCostAttempts ?? 0) + 1;
 				return true;
 			});
 		},
@@ -373,6 +382,23 @@ export default function autoModel(pi: ExtensionAPI): void {
 			}
 		},
 		onAttemptSettled: async (result: AttemptResult, request) => {
+			if (result.notDispatched) {
+				const reservation = request.attemptId ? reservations.get(request.attemptId) : undefined;
+				if (request.attemptId) reservations.delete(request.attemptId);
+				if (!reservation) return;
+				await budgetLedger.reconcile(reservation, 0);
+				const task = store.get(request.sessionId)?.activeTask;
+				if (task?.requestId !== request.requestId) return;
+				task.budgetSpentUsd = Math.max(0, (task.budgetSpentUsd ?? 0) - reservation.estimate);
+				task.attemptCount = Math.max(0, (task.attemptCount ?? 0) - 1);
+				task.unknownCostAttempts = Math.max(0, (task.unknownCostAttempts ?? 0) - 1);
+				return;
+			}
+			const active = store.get(request.sessionId)?.activeTask;
+			if (active?.requestId === request.requestId) {
+				active.finalAttemptSuccess = result.success;
+				active.finalAttemptAborted = result.aborted;
+			}
 			const reservation = request.attemptId ? reservations.get(request.attemptId) : undefined;
 			if (request.attemptId) reservations.delete(request.attemptId);
 			const usage = result.message?.usage;
@@ -382,9 +408,16 @@ export default function autoModel(pi: ExtensionAPI): void {
 			const state = store.get(request.sessionId);
 			if (!state?.activeTask || state.activeTask.requestId !== request.requestId) return;
 			if (reservation && knownCost) state.activeTask.budgetSpentUsd = (state.activeTask.budgetSpentUsd ?? 0) + cost - reservation.estimate;
+			if (reservation && knownCost) state.activeTask.unknownCostAttempts = Math.max(0, (state.activeTask.unknownCostAttempts ?? 0) - 1);
+			// Successes are recorded once per task at settlement so long tool loops do not dominate.
+			// Timeouts and cancellations say nothing about the target's reliability.
+			if (!result.success && !result.aborted && !result.timedOut) {
+				quality.record(result.target.id, result.target.model.provider, request.profile.kinds, false);
+			}
 			const now = Date.now();
 			const attemptEstimate = reservation?.estimate ?? (state.activeTask.profile
-				? estimateCost(result.target, state.activeTask.inputTokens ?? 0, state.activeTask.profile)
+				? estimateCost(result.target, state.activeTask.inputTokens ?? 0, state.activeTask.profile,
+					resolvePrices(configs.get(state.sessionId) ?? DEFAULT_CONFIG, [result.target]).get(result.target.id))
 				: state.activeTask.estimatedCostUsd);
 			if (usage) {
 				metrics.recordActual({ targetId: result.target.id, estimatedCostUsd: attemptEstimate ?? 0,
@@ -406,7 +439,6 @@ export default function autoModel(pi: ExtensionAPI): void {
 				quotaObservation: quotaAdapters.observe(result.target.model.provider, result.headers, now),
 				failover: !result.success && result.retryable,
 			});
-			state.activeTask.finalAttemptSuccess = result.success;
 			if (!state.activeTask.attemptedTargetIds.includes(result.target.id)) {
 				state.activeTask.attemptedTargetIds.push(result.target.id);
 			}
@@ -495,7 +527,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 			config: configs.get(ctx.sessionManager.getSessionId())?.budget ?? DEFAULT_CONFIG.budget,
 		}),
 		(ctx) => configs.get(ctx.sessionManager.getSessionId())?.pools ?? DEFAULT_CONFIG.pools,
-		(ctx) => events.query({ limit: 100 }),
+		(ctx) => events.query({ limit: 10_000 }),
 		quality,
 		async (format) => {
 			const path = join(globalDir, "auto-model", `events-export-${Date.now()}.${format}`);
@@ -537,7 +569,10 @@ export default function autoModel(pi: ExtensionAPI): void {
 			modelRegistry = ctx.modelRegistry;
 			handleSessionStart(_event, ctx, store);
 			await metrics.load(metricsPath);
+			await ensurePriceCache();
 			await budgetLedger.load(budgetPath);
+			const budgetWarning = budgetLedger.takeWarning();
+			if (budgetWarning) notifySafe(ctx, budgetWarning, "warning");
 			await quality.load(qualityPath);
 			await events.load();
 			budgetLedger.startSession(ctx.sessionManager.getSessionId());
@@ -638,12 +673,16 @@ export default function autoModel(pi: ExtensionAPI): void {
 		// A new user task must never inherit an earlier task's dispatch permission.
 		pendingStreams.delete(state.sessionId);
 		if (fromUserPrompt) state.initialPromptHandled = true;
-		forceSettleStaleTask(state, Date.now());
+		settleInterruptedTask(ctx, state);
+		const budgetWarning = budgetLedger.takeWarning();
+		if (budgetWarning) notifySafe(ctx, budgetWarning, "warning");
 		settlePendingActivation(state);
 		if (state.activation !== "active") {
 			return;
 		}
 		const requestId = randomUUID();
+		state.activeTask = { requestId, startedAt: Date.now(), lastActivityAt: Date.now(), phase: "applied",
+			attemptedTargetIds: [], budgetSpentUsd: 0, attemptCount: 0, unknownCostAttempts: 0 };
 		const health = routerHealth.get(state.sessionId);
 		if (health?.bypassUntil && health.bypassUntil > Date.now()) {
 			notifySafe(ctx, "Pi Auto Model routing is temporarily bypassed after repeated internal failures.", "warning");
@@ -663,6 +702,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 			outcome = { status: "failed" };
 		}
 		if (outcome.status === "routed" || outcome.status === "blocked") {
+			if (outcome.status === "blocked" && state.activeTask) state.activeTask.finalAttemptSuccess = false;
 			if (outcome.status === "routed") routerHealth.delete(state.sessionId);
 			// Routed: session state, budgets and notifications were applied
 			// inside applyAutoRoute. Blocked: the user's configuration
@@ -704,6 +744,8 @@ export default function autoModel(pi: ExtensionAPI): void {
 			};
 			const effectivePrompt = prefixPin.strippedPrompt;
 			let classifierCostUsd = 0;
+			let classifierAttempts = 0;
+			let classifierUnknownCosts = 0;
 			let profile = state.activeTask?.profile ?? analyzeTask({
 				prompt: effectivePrompt,
 				imageCount: _event.images?.length,
@@ -715,7 +757,17 @@ export default function autoModel(pi: ExtensionAPI): void {
 						source: config.capabilitySource,
 						overrides: config.benchmarkOverrides,
 					}, config.constraints, { ledger: budgetLedger, config: config.budget,
-						onCost: (cost) => { classifierCostUsd += cost; } });
+						prices: resolvePrices(config, resolvePiCandidates(ctx, config.constraints).targets),
+						onCost: (cost, reconciled) => {
+							classifierCostUsd += cost;
+							if (reconciled) classifierUnknownCosts--;
+							else { classifierAttempts++; classifierUnknownCosts++; }
+							if (state.activeTask?.requestId === requestId) {
+								state.activeTask.budgetSpentUsd = classifierCostUsd;
+								state.activeTask.attemptCount = classifierAttempts;
+								state.activeTask.unknownCostAttempts = classifierUnknownCosts;
+							}
+						} });
 				} catch {
 					// Classifier failures intentionally fall back without user-facing output.
 				}
@@ -1098,6 +1150,8 @@ export default function autoModel(pi: ExtensionAPI): void {
 					? _event.prompt.slice(0, _event.prompt.length - effectivePrompt.length) || undefined
 					: undefined,
 				firstOutputTimeoutMs: config.failover?.firstOutputTimeoutMs,
+				maxAttempts: config.failover.maxAttempts,
+				requestTimeoutMs: config.failover.requestTimeoutMs,
 			};
 			pendingStreams.set(state.sessionId, pendingStream);
 
@@ -1124,7 +1178,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 			state.cacheBoundary = undefined;
 			state.activeTask = {
 				requestId,
-				startedAt: now,
+				startedAt: state.activeTask?.startedAt ?? now,
 				lastActivityAt: now,
 				phase: "applied",
 				routeTargetId: effectivePlan.target.id,
@@ -1133,6 +1187,8 @@ export default function autoModel(pi: ExtensionAPI): void {
 				estimatedCostUsd: effectiveEstimate,
 				inputTokens: contextTokensOf(ctx),
 				budgetSpentUsd: classifierCostUsd,
+				attemptCount: classifierAttempts,
+				unknownCostAttempts: classifierUnknownCosts,
 				failover: retryTarget !== undefined,
 				attemptedTargetIds: previousFailure
 					? [...previousFailure.attemptedTargetIds, effectivePlan.target.id]
@@ -1227,6 +1283,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 			const fallbackQuota = buildProviderQuotaSignals(metrics.providerUsageSnapshot(), config.quota);
 			fallback = buildFallbackPending({
 				ctx,
+				prices: resolvePrices(config, resolvePiCandidates(ctx, config.constraints).targets),
 				config: { ...config, pool: state.manualOverrides.pool ?? config.pool },
 				pinnedTargetId: prefixPin.modelTargetId ?? state.manualOverrides.pinnedTargetId,
 				minimumTier: prefixPin.mode ? modeToMinimumTier(prefixPin.mode) : undefined,
@@ -1281,7 +1338,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 		};
 		state.activeTask = {
 			requestId,
-			startedAt: Date.now(),
+			startedAt: state.activeTask?.startedAt ?? Date.now(),
 			lastActivityAt: Date.now(),
 			phase: "applied",
 			routeTargetId: first.id,
@@ -1289,7 +1346,9 @@ export default function autoModel(pi: ExtensionAPI): void {
 			profile: fallback.profile,
 			estimatedCostUsd: fallback.estimatedCostUsd,
 			inputTokens: contextTokensOf(ctx),
-			budgetSpentUsd: 0,
+			budgetSpentUsd: state.activeTask?.budgetSpentUsd ?? 0,
+			attemptCount: state.activeTask?.attemptCount ?? 0,
+			unknownCostAttempts: state.activeTask?.unknownCostAttempts ?? 0,
 			failover: false,
 			attemptedTargetIds: [first.id],
 		};
@@ -1417,6 +1476,17 @@ export default function autoModel(pi: ExtensionAPI): void {
 		},
 	));
 
+	/** Settles a task that never received agent_settled, keeping its real outcome when one is known. */
+	function settleInterruptedTask(ctx: ExtensionContext, state: SessionRuntimeState): void {
+		const previous = state.activeTask;
+		if (!previous) return;
+		if (previous.finalAttemptSuccess === undefined) previous.finalAttemptAborted = true;
+		const failedRoute = state.lastFailedRoute;
+		settleActiveTask(ctx, state.sessionId);
+		// Settlement clears lastFailedRoute; keep it so the next task still avoids a failed target.
+		if (previous.lastFailure && failedRoute) state.lastFailedRoute = failedRoute;
+	}
+
 	function settleActiveTask(ctx: ExtensionContext, sessionId: string, expectedRequestId?: string): void {
 		const state = store.get(sessionId);
 		if (!state?.activeTask) {
@@ -1424,11 +1494,12 @@ export default function autoModel(pi: ExtensionAPI): void {
 		}
 		if (expectedRequestId && state.activeTask.requestId !== expectedRequestId) return;
 		state.activeTask.phase = "settled";
-		if (!state.activeTask.resultRecorded && state.activeTask.routeTargetId) {
+		if (!state.activeTask.resultRecorded && state.activeTask.routeTargetId &&
+			state.activeTask.finalAttemptSuccess !== undefined && !state.activeTask.finalAttemptAborted) {
 			state.lastFailedRoute = undefined;
 			metrics.record({
 				targetId: state.activeTask.routeTargetId,
-				success: true,
+				success: state.activeTask.finalAttemptSuccess,
 				latencyMs: Date.now() - state.activeTask.startedAt,
 				estimatedCostUsd: state.activeTask.estimatedCostUsd,
 				quotaObservation: state.activeTask.quotaObservation,
@@ -1443,10 +1514,15 @@ export default function autoModel(pi: ExtensionAPI): void {
 				at: Date.now(),
 				targetId: state.activeTask.routeTargetId,
 				provider,
-				success: true,
+				success: state.activeTask.finalAttemptSuccess,
 				latencyMs: Date.now() - state.activeTask.startedAt,
 			});
 			void metrics.flush().catch(() => {});
+		}
+		// Successes are learned once per task; failed attempts are learned as they settle.
+		if (state.activeTask.routeTargetId && state.activeTask.finalAttemptSuccess === true && !state.activeTask.finalAttemptAborted) {
+			quality.record(state.activeTask.routeTargetId, state.activeTask.routeTargetId.split("/", 1)[0],
+				state.activeTask.profile?.kinds ?? ["mixed"], true);
 		}
 		if (state.activeTask.routeTargetId) {
 			const usage = state.activeTask.actualUsage;
@@ -1479,13 +1555,17 @@ export default function autoModel(pi: ExtensionAPI): void {
 					},
 				});
 			}
-			quality.record(
-				state.activeTask.routeTargetId,
-				state.activeTask.routeTargetId.split("/", 1)[0],
-				state.activeTask.profile?.kinds ?? ["mixed"],
-				state.activeTask.finalAttemptSuccess !== false && (state.activeTask.toolCallErrors ?? 0) === 0,
-			);
 		}
+		const task = state.activeTask;
+		events.record({ id: `task-${task.requestId}`, kind: "task_summary", requestId: task.requestId,
+			sessionId, at: Date.now(), targetId: task.routeTargetId, taskKinds: task.profile?.kinds,
+			latencyMs: Date.now() - task.startedAt, costUsd: task.budgetSpentUsd ?? 0,
+			metadata: { outcome: task.finalAttemptAborted ? "cancelled" : task.finalAttemptSuccess === false ? "failure" : "unknown",
+				costBasis: (task.attemptCount ?? 0) > 0 && task.unknownCostAttempts === 0 ? "reported" : "estimated",
+				attempts: task.attemptCount ?? 0, toolErrors: task.toolCallErrors ?? 0,
+				escalated: task.stageEscalated ?? false, escalationReason: task.escalationReason,
+				policy: state.routingPolicy ?? "balanced" },
+		});
 		state.activeTask = undefined;
 		state.lastTaskEndedAt = Date.now();
 		pendingStreams.delete(state.sessionId);
@@ -1527,8 +1607,11 @@ export default function autoModel(pi: ExtensionAPI): void {
 	pi.on("message_end", safeHandler<MessageEndEvent>("message_end", (event, ctx) => {
 		const state = store.get(ctx.sessionManager.getSessionId());
 		if (!state?.activeTask || event.message.role !== "assistant") return;
+		if (event.message.stopReason === "aborted") state.activeTask.finalAttemptAborted = true;
+		if (event.message.stopReason === "error") state.activeTask.finalAttemptSuccess = false;
 		// Proxy usage is settled per attempt, including failures and target changes.
 		if (pendingStreams.has(state.sessionId)) return;
+		if (event.message.stopReason !== "error" && event.message.stopReason !== "aborted") state.activeTask.finalAttemptSuccess = true;
 		const usage = event.message.usage;
 		if (!usage) return;
 		const current = state.activeTask.actualUsage ?? {
@@ -1569,20 +1652,30 @@ export default function autoModel(pi: ExtensionAPI): void {
 		if (state?.activeTask) {
 			if (event.isError) {
 				state.activeTask.toolCallErrors = (state.activeTask.toolCallErrors ?? 0) + 1;
+				const kind = classifyToolFailure(event.toolName, event.result);
+				const task = state.activeTask;
+				task.recoveryFailures = kind === "execution" ? (task.lastRecoveryTool === event.toolName ? task.recoveryFailures ?? 0 : 0) + 1 : 0;
+				task.lastRecoveryTool = event.toolName;
+				events.record({ id: `tool-failure-${task.requestId}-${task.toolCallErrors}`, kind: "tool_failure",
+					requestId: task.requestId, sessionId: state.sessionId, at: Date.now(), targetId: task.routeTargetId,
+					metadata: { failureKind: kind, tool: event.toolName } });
 				const pending = pendingStreams.get(state.sessionId);
-				if (state.activeTask.toolCallErrors >= 2 && !state.activeTask.stageEscalated && pending) {
+				if (task.recoveryFailures >= 2 && !task.stageEscalated && pending) {
 					const config = configs.get(state.sessionId) ?? DEFAULT_CONFIG;
-					const strongest = [...pending.targets].sort((left, right) =>
+					const strongest = pending.targets.filter((target) => !circuits.isOpen(target.id)).sort((left, right) =>
 						tierRank(deriveCapabilityPrior(right.model, { source: config.capabilitySource, overrides: config.benchmarkOverrides }).overall) -
 						tierRank(deriveCapabilityPrior(left.model, { source: config.capabilitySource, overrides: config.benchmarkOverrides }).overall),
 					)[0];
-					if (strongest && strongest.id !== pending.targets[0]?.id) {
+					const capabilityOptions = { source: config.capabilitySource, overrides: config.benchmarkOverrides };
+					if (strongest && pending.targets[0] && tierRank(deriveCapabilityPrior(strongest.model, capabilityOptions).overall) >
+						tierRank(deriveCapabilityPrior(pending.targets[0].model, capabilityOptions).overall)) {
 						pendingStreams.set(state.sessionId, {
 							...pending,
 							targets: [strongest, ...pending.targets.filter((target) => target.id !== strongest.id)],
 							thinking: chooseThinkingLevel(strongest.model, pending.profile),
 						});
 						state.activeTask.stageEscalated = true;
+						state.activeTask.escalationReason = `repeated ${event.toolName} execution errors`;
 						events.record({
 							id: `stage-escalation-${state.activeTask.requestId}`,
 							requestId: state.activeTask.requestId,
@@ -1590,10 +1683,13 @@ export default function autoModel(pi: ExtensionAPI): void {
 							kind: "failover",
 							at: Date.now(),
 							targetId: strongest.id,
-							metadata: { reason: "repeated tool errors", toolCallErrors: state.activeTask.toolCallErrors },
+							metadata: { reason: state.activeTask.escalationReason, toolCallErrors: state.activeTask.toolCallErrors },
 						});
 					}
 				}
+			} else {
+				state.activeTask.recoveryFailures = 0;
+				state.activeTask.lastRecoveryTool = undefined;
 			}
 			state.activeTask.lastActivityAt = Date.now();
 		}
@@ -1632,7 +1728,18 @@ export default function autoModel(pi: ExtensionAPI): void {
 			}
 			const state = stateForContext(store, ctx);
 			try {
-				return await handleBeforeCompact(event, ctx, state, configs.get(state.sessionId) ?? DEFAULT_CONFIG, budgetLedger, circuits);
+				const config = configs.get(state.sessionId) ?? DEFAULT_CONFIG;
+				const task = state.activeTask;
+				const compactionConfig = task && config.budget.maxUsdPerTask !== undefined
+					? { ...config, budget: { ...config.budget, maxUsdPerTask: Math.max(0, config.budget.maxUsdPerTask - (task.budgetSpentUsd ?? 0)) } }
+					: config;
+				return await handleBeforeCompact(event, ctx, state, compactionConfig, budgetLedger, circuits,
+					resolvePrices(config, resolvePiCandidates(ctx, config.constraints).targets), (cost, reconciled) => {
+						if (!task || state.activeTask !== task) return;
+						task.budgetSpentUsd = (task.budgetSpentUsd ?? 0) + cost;
+						task.unknownCostAttempts = (task.unknownCostAttempts ?? 0) + (reconciled ? -1 : 1);
+						if (!reconciled) task.attemptCount = (task.attemptCount ?? 0) + 1;
+					});
 			} catch (error) {
 				notifySafe(ctx, `Pi Auto Model compaction cancelled: ${errorMessage(error)}`);
 				return { cancel: true };
@@ -1672,6 +1779,8 @@ export default function autoModel(pi: ExtensionAPI): void {
 	pi.on(
 		"session_shutdown",
 		safeHandler<SessionShutdownEvent>("session_shutdown", async (_event, ctx) => {
+			const state = store.get(ctx.sessionManager.getSessionId());
+			if (state) settleInterruptedTask(ctx, state);
 			clearAutoModelStatus(ctx);
 			await Promise.allSettled([metrics.flush(), quality.flush(), events.flush()]);
 			store.delete(ctx.sessionManager.getSessionId());

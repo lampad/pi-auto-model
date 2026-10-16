@@ -166,8 +166,8 @@ export class QualityLearning {
 		const exploration = Math.min(0.08, 0.08 * (1 - confidence));
 		const score = clamp(base * confidence + 0.5 * (1 - confidence) + feedback + exploration);
 		const reason = targetStats
-			? `quality ${Math.round(score * 100)}% · ${Math.round(confidence * 100)}% confidence`
-			: "quality cold-start exploration";
+			? `reliability ${Math.round(score * 100)}% · ${Math.round(confidence * 100)}% confidence (includes feedback)`
+			: "reliability cold-start exploration";
 		return { score, reason };
 	}
 

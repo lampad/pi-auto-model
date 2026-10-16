@@ -52,6 +52,8 @@ export interface PendingStreamRequest {
 	 * Off when undefined.
 	 */
 	firstOutputTimeoutMs?: number;
+	maxAttempts?: number;
+	requestTimeoutMs?: number;
 	/** Unique dispatch identity, including retries and tool-loop continuations. */
 	attemptId?: string;
 }
@@ -66,6 +68,10 @@ export interface AttemptResult {
 	headers: Record<string, string>;
 	success: boolean;
 	retryable: boolean;
+	aborted?: boolean;
+	timedOut?: boolean;
+	/** Approved by beforeAttempt but stopped before any provider request was sent. */
+	notDispatched?: boolean;
 	latencyMs: number;
 	ttftMs?: number;
 	message?: AssistantMessage;
@@ -83,6 +89,7 @@ export interface StreamProxyDeps {
 	onAttemptSettled?: (result: AttemptResult, request: PendingStreamRequest) => unknown;
 	/** Called when the proxy selects a target (for state recording). */
 	onTargetCommitted?: (target: RouteTarget, request: PendingStreamRequest) => void;
+	onRequestStopped?: (request: PendingStreamRequest, timedOut: boolean) => void;
 	/** Called when the proxy implementation itself throws, never for provider failures. */
 	onInternalError?: (error: unknown, sessionId?: string) => void;
 }
@@ -154,9 +161,9 @@ function ignoreFailure(action: (() => void) | undefined): void {
 async function allowOnFailure(action: (() => boolean | string | Promise<boolean | string>) | undefined): Promise<boolean | string> {
 	try {
 		return action ? await action() : true;
-	} catch {
+	} catch (error) {
 		// A failed policy check is not permission to send a request.
-		return false;
+		return `policy check failed: ${extractErrorText(error)}`;
 	}
 }
 
@@ -314,7 +321,39 @@ export function createStreamProxyHandler(
 ): (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
 	return (_autoModel, context, options) => {
 		const outer = createAssistantMessageEventStream();
-		void runFailoverLoop(outer, context, options, deps).catch((error) => {
+		// Remember the last forwarded partial so a stop keeps text the user already saw.
+		let partial: AssistantMessage | undefined;
+		const push = outer.push.bind(outer);
+		outer.push = (event) => {
+			if ("partial" in event) partial = event.partial;
+			push(event);
+		};
+		void (async () => {
+			const plan = deps.getPendingStream(options?.sessionId);
+			const controller = new AbortController();
+			const signal = options?.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+			const cancel = (): void => {
+				const timedOut = signal.reason?.name === "TimeoutError";
+				if (plan) ignoreFailure(() => deps.onRequestStopped?.(plan, timedOut));
+				const text = timedOut ? "Pi Auto Model: request time limit exceeded." : "Request aborted.";
+				const stopReason = timedOut ? "error" as const : "aborted" as const;
+				const error: AssistantMessage = partial
+					? { ...partial, content: [...partial.content], stopReason, errorMessage: text }
+					: { ...makeErrorMessage(text), stopReason };
+				outer.push({ type: "error", reason: stopReason, error });
+				outer.end(error);
+			};
+			signal.addEventListener("abort", cancel, { once: true });
+			const timer = plan?.requestTimeoutMs ? setTimeout(() => controller.abort(
+				new DOMException("Request time limit exceeded", "TimeoutError")), plan.requestTimeoutMs) : undefined;
+			try {
+				if (signal.aborted) cancel();
+				await runFailoverLoop(outer, context, { ...options, signal }, deps, plan);
+			} finally {
+				clearTimeout(timer);
+				signal.removeEventListener("abort", cancel);
+			}
+		})().catch((error) => {
 			ignoreFailure(deps.onInternalError ? () => deps.onInternalError!(error, options?.sessionId) : undefined);
 			finishWithError(outer, `Pi Auto Model internal routing failure: ${extractErrorText(error)}`);
 		});
@@ -327,8 +366,8 @@ async function runFailoverLoop(
 	context: Context,
 	options: SimpleStreamOptions | undefined,
 	deps: StreamProxyDeps,
+	plan: PendingStreamRequest | undefined,
 ): Promise<void> {
-	const plan = deps.getPendingStream(options?.sessionId);
 	if (!plan?.targets.length) {
 		pushError(outer, "Pi Auto Model: no approved route plan available.");
 		return;
@@ -339,7 +378,12 @@ async function runFailoverLoop(
 		return;
 	}
 	let lastErrorText = "All targets failed";
+	let attempts = 0;
 	for (const target of plan.targets) {
+		if (attempts >= (plan.maxAttempts ?? 3)) {
+			lastErrorText = `Pi Auto Model: attempt limit reached (${attempts}). Last failure: ${lastErrorText}`;
+			break;
+		}
 		if (options?.signal?.aborted) {
 			const error = { ...makeErrorMessage("Request aborted."), stopReason: "aborted" as const };
 			outer.push({ type: "error", reason: "aborted", error });
@@ -351,6 +395,7 @@ async function runFailoverLoop(
 		if (!provider?.streamSimple) continue;
 		let auth: Awaited<ReturnType<ModelRegistry["getApiKeyAndHeaders"]>>;
 		try { auth = await registry.getApiKeyAndHeaders(target.model); } catch { continue; }
+		if (options?.signal?.aborted) return;
 		if (!auth.ok) continue;
 		const probing = deps.circuits.getState(target.id) === "half-open";
 		if (probing && !deps.circuits.tryAcquireProbe(target.id)) continue;
@@ -361,6 +406,16 @@ async function runFailoverLoop(
 			requiredOutputTokens: Math.min(options?.maxTokens ?? AUTO_MODEL_MAX_TOKENS, target.model.maxTokens),
 		} } };
 		const allowed = await allowOnFailure(deps.beforeAttempt ? () => deps.beforeAttempt!(target, pending, context) : undefined);
+		if (options?.signal?.aborted) {
+			if (probing) deps.circuits.releaseProbe(target.id);
+			if (allowed === true) {
+				try {
+					await deps.onAttemptSettled?.({ target, status: 0, headers: {}, success: false, retryable: false,
+						aborted: true, notDispatched: true, latencyMs: 0 }, pending);
+				} catch { /* Keep the reservation when accounting is unavailable. */ }
+			}
+			return;
+		}
 		if (allowed !== true) {
 			if (probing) deps.circuits.releaseProbe(target.id);
 			lastErrorText = typeof allowed === "string" ? `Pi Auto Model: ${target.id}: ${allowed}.`
@@ -384,6 +439,7 @@ async function runFailoverLoop(
 			ignoreFailure(deps.onTargetCommitted ? () => deps.onTargetCommitted!(target, pending) : undefined);
 		};
 		try {
+			attempts++;
 			const inner = provider.streamSimple(requestModel, adaptContext(context, target, plan.apisUsed, plan.prefixToStrip), {
 				...options, signal, apiKey: auth.apiKey, env: auth.env,
 				headers: { ...auth.headers, ...(options?.headers as Record<string, string>) },
@@ -415,6 +471,7 @@ async function runFailoverLoop(
 		}
 		const success = terminal?.type === "done";
 		const aborted = options?.signal?.aborted || (terminal?.type === "error" && terminal.reason === "aborted");
+		const timedOut = options?.signal?.aborted && options.signal.reason?.name === "TimeoutError";
 		lastErrorText = terminal?.type === "error" ? extractErrorText(terminal) : "Provider stream ended without a completion event.";
 		const status = responseStatus >= 400 ? responseStatus : success ? responseStatus || 200 : 503;
 		const classification = classifyDetailedError(status, lastErrorText, substantive);
@@ -424,6 +481,7 @@ async function runFailoverLoop(
 			await deps.onAttemptSettled?.({
 				target, status: responseStatus || (success ? 200 : 0), headers: responseHeaders,
 				success, retryable, latencyMs: Date.now() - startedAt, ttftMs,
+				aborted: Boolean(aborted && !timedOut), timedOut: Boolean(timedOut),
 				message: terminal?.type === "done" ? terminal.message : terminal?.error,
 			}, pending);
 		} catch { /* Keep the reservation when accounting is unavailable. */ }

@@ -166,6 +166,114 @@ function makeDeps(
 
 // ─── Tests ──────────────────────────────────────────────────────
 
+test("a user abort after visible output keeps the partial text in the final message", async () => {
+	const controller = new AbortController();
+	const registry = makeFakeRegistry(new Map([["p", { streamSimple: () => {
+		const stream = createAssistantMessageEventStream();
+		queueMicrotask(() => {
+			stream.push(textDeltaEvent("partial answer"));
+			setTimeout(() => controller.abort(), 5);
+		});
+		return stream;
+	} }]]));
+	const { deps } = makeDeps(makePending([target("p", "one")]), registry, new CircuitBreaker());
+	const stream = createStreamProxyHandler(deps)(model("pi-auto-model", "auto"), { messages: [] }, { signal: controller.signal });
+	const events = await collectEvents(stream);
+	const final = await stream.result();
+	assert.equal(events.at(-1)?.type, "error");
+	assert.equal(final.stopReason, "aborted");
+	assert.deepEqual(final.content, [{ type: "text", text: "partial answer" }]);
+});
+
+test("an abort after budget approval but before dispatch settles the attempt as not sent", async () => {
+	const controller = new AbortController();
+	let calls = 0;
+	const registry = makeFakeRegistry(new Map([["p", { streamSimple: () => { calls++; return hangStream(); } }]]));
+	const { deps, settled } = makeDeps(makePending([target("p", "one")]), registry, new CircuitBreaker());
+	deps.beforeAttempt = () => { controller.abort(); return true; };
+	await collectEvents(createStreamProxyHandler(deps)(model("pi-auto-model", "auto"), { messages: [] }, { signal: controller.signal }));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(calls, 0);
+	assert.equal(settled.length, 1);
+	assert.equal(settled[0].notDispatched, true);
+});
+
+test("caps actual dispatches and does not count policy-skipped candidates", async () => {
+	const calls: string[] = [];
+	const candidates = [target("p", "skip"), target("p", "one"), target("p", "two"), target("p", "three")];
+	const registry = makeFakeRegistry(new Map([["p", { streamSimple: (model: Model<Api>) => {
+		calls.push(model.id);
+		return streamFromEvents([errorEvent()]);
+	} }]]));
+	const { deps } = makeDeps({ ...makePending(candidates), maxAttempts: 2 }, registry, new CircuitBreaker());
+	deps.beforeAttempt = (candidate) => candidate.model.id !== "skip";
+	const events = await collectEvents(createStreamProxyHandler(deps)(model("pi-auto-model", "auto"), { messages: [] }));
+	assert.deepEqual(calls, ["one", "two"]);
+	assert.match((events.at(-1) as Extract<AssistantMessageEvent, { type: "error" }>).error.errorMessage!, /attempt limit/);
+});
+
+test("total request timeout aborts a stream even after output without replay", async () => {
+	let signal: AbortSignal | undefined;
+	let calls = 0;
+	const registry = makeFakeRegistry(new Map([["p", { streamSimple: (_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
+		calls++;
+		signal = options?.signal;
+		return streamFromEvents([textDeltaEvent("partial")]);
+	} }]]));
+	const { deps } = makeDeps({ ...makePending([target("p", "one"), target("p", "two")]), requestTimeoutMs: 30 }, registry, new CircuitBreaker());
+	const events = await collectEvents(createStreamProxyHandler(deps)(model("pi-auto-model", "auto"), { messages: [] }));
+	assert.equal(events[0].type, "text_delta");
+	assert.match((events.at(-1) as Extract<AssistantMessageEvent, { type: "error" }>).error.errorMessage!, /time limit/);
+	assert.equal(signal?.aborted, true);
+	assert.equal(calls, 1);
+});
+
+test("total request timeout includes authorization and prevents late dispatch", async () => {
+	let release!: () => void;
+	let calls = 0;
+	const registry = makeFakeRegistry(new Map([["p", { streamSimple: () => { calls++; return hangStream(); } }]]));
+	registry.getApiKeyAndHeaders = async () => {
+		await new Promise<void>((resolve) => { release = resolve; });
+		return { ok: true, apiKey: "test-key", baseUrl: undefined, headers: undefined };
+	};
+	const { deps } = makeDeps({ ...makePending([target("p", "one")]), requestTimeoutMs: 20 }, registry, new CircuitBreaker());
+	const events = await collectEvents(createStreamProxyHandler(deps)(model("pi-auto-model", "auto"), { messages: [] }));
+	assert.equal(events.at(-1)?.type, "error");
+	release();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(calls, 0);
+});
+
+test("total request timeout is shared across fallback attempts", async () => {
+	let calls = 0;
+	const registry = makeFakeRegistry(new Map([["p", { streamSimple: () => { calls++; return hangStream(); } }]]));
+	const { deps } = makeDeps({ ...makePending([target("p", "one"), target("p", "two"), target("p", "three")], 40),
+		requestTimeoutMs: 65 }, registry, new CircuitBreaker());
+	const events = await collectEvents(createStreamProxyHandler(deps)(model("pi-auto-model", "auto"), { messages: [] }));
+	assert.ok(calls >= 1 && calls <= 2);
+	assert.match((events.at(-1) as Extract<AssistantMessageEvent, { type: "error" }>).error.errorMessage!, /time limit/);
+});
+
+test("cross-provider failover adapts history without mutating the original context", async () => {
+	const first = target("anthropic", "first");
+	first.model.api = "anthropic-messages";
+	const second = target("openai", "second");
+	second.model.api = "openai-completions";
+	const context: Context = { messages: [{ role: "assistant", content: [
+		{ type: "thinking", thinking: "private", thinkingSignature: "signature" }, { type: "text", text: "answer" },
+	] } as AssistantMessage] };
+	const observed: Context[] = [];
+	const registry = makeFakeRegistry(new Map([
+		["anthropic", { streamSimple: (_model: Model<Api>, request: Context) => { observed.push(request); return streamFromEvents([errorEvent()]); } }],
+		["openai", { streamSimple: (_model: Model<Api>, request: Context) => { observed.push(request); return streamFromEvents([doneEvent("ok")]); } }],
+	]));
+	const { deps } = makeDeps({ ...makePending([first, second]), apisUsed: ["anthropic-messages"] }, registry, new CircuitBreaker());
+	assert.equal((await collectEvents(createStreamProxyHandler(deps)(model("pi-auto-model", "auto"), context))).at(-1)?.type, "done");
+	assert.equal(observed[0].messages[0].content.length, 2);
+	assert.equal(observed[1].messages[0].content.length, 1);
+	assert.equal(context.messages[0].content.length, 2);
+});
+
 test("policy failures fail closed and a busy half-open probe never reserves budget", async () => {
 	const selected = target("openai", "gpt-5");
 	let calls = 0;

@@ -232,6 +232,8 @@ export function isValidConfig(value: unknown): value is Partial<AutoModelConfig>
 
 	if (value.failover !== undefined && (!isRecord(value.failover) ||
 		!optionalPositiveInteger(value.failover.maxAttempts) ||
+		!optionalPositiveInteger(value.failover.requestTimeoutMs) ||
+		(typeof value.failover.requestTimeoutMs === "number" && value.failover.requestTimeoutMs > 2_147_483_647) ||
 		!optionalPositiveNumber(value.failover.firstOutputTimeoutMs))) return false;
 	if (value.classifier !== undefined && (!isRecord(value.classifier) || !optionalBoolean(value.classifier.enabled) ||
 		!optionalNumberInRange(value.classifier.confidenceThreshold, 1) || !optionalPositiveNumber(value.classifier.timeoutMs))) return false;

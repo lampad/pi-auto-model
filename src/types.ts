@@ -209,6 +209,8 @@ export interface ProviderQuotaObservation {
 
 export interface FailoverConfig {
 	maxAttempts: number;
+	/** Wall-clock limit for one stream request, including all fallback attempts. Off by default. */
+	requestTimeoutMs?: number;
 	/**
 	 * Optional fail-safe: fail over when a target produces no substantive
 	 * output within this many milliseconds. Defaults to off (undefined) to
@@ -311,6 +313,12 @@ export interface TaskRoutingState {
 	toolCallErrors?: number;
 	stageEscalated?: boolean;
 	finalAttemptSuccess?: boolean;
+	finalAttemptAborted?: boolean;
+	attemptCount?: number;
+	unknownCostAttempts?: number;
+	recoveryFailures?: number;
+	lastRecoveryTool?: string;
+	escalationReason?: string;
 	actualUsage?: {
 		inputTokens: number;
 		outputTokens: number;

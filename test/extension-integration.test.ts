@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -752,8 +752,10 @@ test("escalates the next model call after repeated tool errors", async () => {
 		await fixture.pi.emit("before_agent_start", {
 			type: "before_agent_start", prompt: "Summarize this paragraph", systemPrompt: "", systemPromptOptions: {},
 		}, fixture.ctx);
-		await fixture.pi.emit("tool_execution_end", { type: "tool_execution_end", isError: true }, fixture.ctx);
-		await fixture.pi.emit("tool_execution_end", { type: "tool_execution_end", isError: true }, fixture.ctx);
+		const failure = { type: "tool_execution_end", toolName: "edit", isError: true,
+			result: { content: [{ type: "text", text: "Could not find the exact old text" }] } };
+		await fixture.pi.emit("tool_execution_end", failure, fixture.ctx);
+		await fixture.pi.emit("tool_execution_end", failure, fixture.ctx);
 		await collectEvents(virtual.streamSimple!(
 			fixture.ctx.model,
 			{ messages: [] },
@@ -813,6 +815,263 @@ async function dispatch(fixture: Awaited<ReturnType<typeof setup>>): Promise<Ass
 		fixture.ctx.model, { messages: [] }, { sessionId: "integration-session" },
 	));
 }
+
+test("task diagnostics keep successful delivery unknown until explicit outcome and include auxiliary costs", async () => {
+	const f = await setup({ constraints: { providerAllow: ["openai"] }, classifier: { enabled: true }, pricing: { litellm: { enabled: false } } });
+	(f.ctx.modelRegistry as any).complete = async () => ({ content: [{ type: "text", text: '{"complexity":0.2}' }], usage: { cost: { total: 0.002 } } });
+	f.ctx.providers.set("openai", { streamSimple: () => {
+		const done = doneEvent("ok") as Extract<AssistantMessageEvent, { type: "done" }>;
+		done.message.stopReason = "stop";
+		done.message.usage = { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 110,
+			cost: { input: 0.01, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 } };
+		return streamFromEvents([done]);
+	} });
+	try {
+		await begin(f);
+		await dispatch(f);
+		await dispatch(f);
+		await f.pi.emit("tool_execution_end", { toolName: "bash", isError: true,
+			result: { content: [{ type: "text", text: "1 test failed: AssertionError" }] } }, f.ctx);
+		await f.pi.emit("session_before_compact", compactionEvent(), f.ctx);
+		await f.pi.emit("agent_settled", {}, f.ctx);
+		const command = f.pi.commands.get("auto-model")!;
+		await command.handler("task", f.ctx);
+		assert.match(f.ctx.notifications.at(-1)!, /Outcome: unknown/);
+		assert.match(f.ctx.notifications.at(-1)!, /Cost: \$0\.0320 \(reported/);
+		assert.match(f.ctx.notifications.at(-1)!, /Attempts: 4/);
+		await command.handler("outcome success", f.ctx);
+		await command.handler("task", f.ctx);
+		assert.match(f.ctx.notifications.at(-1)!, /Outcome: success \(user assessment\)/);
+		await f.pi.emit("session_shutdown", {}, f.ctx);
+		const quality = JSON.parse(await readFile(join(f.root, ".pi/agent/auto-model/quality.json"), "utf8"));
+		assert.equal(quality.targets["openai/gpt-5"].failures, 0, "validation failure is not delivery failure");
+		const events = (await readFile(join(f.root, ".pi/agent/auto-model/events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+		assert.equal(events.filter((event) => event.kind === "task_summary").length, 1);
+		assert.equal(events.find((event) => event.kind === "task_outcome").metadata.evidence, "user");
+	} finally { f.restore(); }
+});
+
+test("task diagnostics retain unknown cost and cancelled outcomes", async () => {
+	const f = await setup({ constraints: { providerAllow: ["openai"] }, pricing: { litellm: { enabled: false } } });
+	f.ctx.providers.set("openai", { streamSimple: () => streamFromEvents([{ type: "error", reason: "aborted",
+		error: { role: "assistant", content: [], stopReason: "aborted" } as unknown as AssistantMessage }]) });
+	try {
+		await begin(f);
+		await dispatch(f);
+		await f.pi.emit("agent_settled", {}, f.ctx);
+		await f.pi.commands.get("auto-model")!.handler("task", f.ctx);
+		assert.match(f.ctx.notifications.at(-1)!, /Outcome: cancelled/);
+		assert.match(f.ctx.notifications.at(-1)!, /\(estimated/);
+	} finally { f.restore(); }
+});
+
+test("reliability learning counts a multi-turn successful task once", async () => {
+	const f = await setup({ constraints: { providerAllow: ["openai"] }, pricing: { litellm: { enabled: false } } });
+	f.ctx.providers.set("openai", { streamSimple: () => streamFromEvents([doneEvent("ok")]) });
+	try {
+		await begin(f);
+		await dispatch(f);
+		await dispatch(f);
+		await dispatch(f);
+		await f.pi.emit("agent_settled", {}, f.ctx);
+		await f.pi.emit("session_shutdown", {}, f.ctx);
+		const quality = JSON.parse(await readFile(join(f.root, ".pi/agent/auto-model/quality.json"), "utf8"));
+		assert.equal(Math.round(quality.targets["openai/gpt-5"].attempts), 1);
+		assert.equal(quality.targets["openai/gpt-5"].failures, 0);
+	} finally { f.restore(); }
+});
+
+test("a new prompt keeps the known outcome of a task that never received agent_settled", async () => {
+	const f = await setup({ constraints: { providerAllow: ["openai"] }, pricing: { litellm: { enabled: false } } });
+	f.ctx.providers.set("openai", { streamSimple: () => streamFromEvents([{ type: "error", reason: "error",
+		error: { role: "assistant", content: [], stopReason: "error", errorMessage: "bad request" } as unknown as AssistantMessage }]) });
+	try {
+		await begin(f);
+		await dispatch(f);
+		await f.pi.emit("before_agent_start", { type: "before_agent_start", prompt: "next", systemPrompt: "", systemPromptOptions: {} }, f.ctx);
+		await f.pi.emit("session_shutdown", {}, f.ctx);
+		const events = (await readFile(join(f.root, ".pi/agent/auto-model/events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+		const summaries = events.filter((event) => event.kind === "task_summary");
+		assert.equal(summaries.length, 2);
+		assert.equal(summaries[0].metadata.outcome, "failure", "not relabelled as cancelled by the next prompt");
+	} finally { f.restore(); }
+});
+
+test("timed-out authorization records task failure without a provider dispatch", async () => {
+	const f = await setup({ failover: { requestTimeoutMs: 25 } });
+	let release!: () => void;
+	f.ctx.modelRegistry.getApiKeyAndHeaders = async () => {
+		await new Promise<void>((resolve) => { release = resolve; });
+		return { ok: true, apiKey: "test-key", baseUrl: undefined, headers: undefined };
+	};
+	f.ctx.providers.set("openai", { streamSimple: () => { throw new Error("must not dispatch"); } });
+	try {
+		await begin(f);
+		assert.equal((await dispatch(f)).at(-1)?.type, "error");
+		await f.pi.emit("agent_settled", {}, f.ctx);
+		await f.pi.commands.get("auto-model")!.handler("task", f.ctx);
+		assert.match(f.ctx.notifications.at(-1)!, /Outcome: failure/);
+		release();
+	} finally { f.restore(); }
+});
+
+test("classifier cost survives a subsequent budget-blocked task", async () => {
+	const f = await setup({ classifier: { enabled: true }, constraints: { providerAllow: ["openai"] },
+		pricing: { litellm: { enabled: false } }, budget: { dailyUsd: 0.003, onExceed: "block" } });
+	(f.ctx.modelRegistry as any).complete = async () => ({ content: [{ type: "text", text: '{"complexity":0.2}' }], usage: { cost: { total: 0.002 } } });
+	try {
+		await begin(f);
+		await f.pi.emit("agent_settled", {}, f.ctx);
+		await f.pi.commands.get("auto-model")!.handler("task", f.ctx);
+		assert.match(f.ctx.notifications.at(-1)!, /Outcome: failure/);
+		assert.match(f.ctx.notifications.at(-1)!, /Cost: \$0\.0020 \(reported/);
+	} finally { f.restore(); }
+});
+
+test("compaction cannot spend a task allowance already consumed by the main request", async () => {
+	const f = await setup({ constraints: { providerAllow: ["openai"] }, pricing: { litellm: { enabled: false } },
+		budget: { maxUsdPerTask: 0.02, onExceed: "block" } });
+	let calls = 0;
+	f.ctx.providers.set("openai", { streamSimple: () => {
+		calls++;
+		const done = doneEvent("ok") as Extract<AssistantMessageEvent, { type: "done" }>;
+		done.message.usage = { cost: { total: 0.02 } } as AssistantMessage["usage"];
+		return streamFromEvents([done]);
+	} });
+	try {
+		await begin(f);
+		await dispatch(f);
+		const result = await f.pi.emit("session_before_compact", compactionEvent(), f.ctx);
+		assert.equal(result?.cancel, true);
+		assert.equal(calls, 1);
+	} finally { f.restore(); }
+});
+
+test("validation, environment and interrupted execution failures do not escalate", async () => {
+	for (const scenario of ["validation", "environment", "recovered"]) {
+		const f = await setup({ policy: "cost", pricing: { litellm: { enabled: false },
+			overrides: { "anthropic/claude-sonnet": { input: 0.1, output: 0.1 }, "openai/gpt-5": { input: 10, output: 10 } } } });
+		const strong = f.ctx.modelRegistry.find("openai", "gpt-5")!;
+		const cheap = f.ctx.modelRegistry.find("anthropic", "claude-sonnet")!;
+		strong.cost.input = strong.cost.output = 10;
+		cheap.cost.input = cheap.cost.output = 0;
+		const calls: string[] = [];
+		for (const provider of ["openai", "anthropic"]) f.ctx.providers.set(provider, {
+			streamSimple: () => { calls.push(provider); return streamFromEvents([doneEvent("ok")]); },
+		});
+		try {
+			await begin(f);
+			const error = { toolName: scenario === "recovered" ? "edit" : "bash", isError: true,
+				result: { content: [{ type: "text", text: scenario === "validation" ? "2 tests failed" : scenario === "environment" ? "command not found" : "old text not found" }] } };
+			await f.pi.emit("tool_execution_end", error, f.ctx);
+			if (scenario === "recovered") await f.pi.emit("tool_execution_end", { toolName: "edit", isError: false }, f.ctx);
+			await f.pi.emit("tool_execution_end", error, f.ctx);
+			await dispatch(f);
+			assert.deepEqual(calls, ["anthropic"], scenario);
+		} finally { f.restore(); }
+	}
+});
+
+test("price overrides govern preview, dispatch and cumulative tool-loop reservations", async () => {
+	const f = await setup({ constraints: { providerAllow: ["openai"] },
+		pricing: { litellm: { enabled: false }, costCoef: 100, overrides: { "openai/gpt-5": { input: 0.1, output: 0.1 } } },
+		budget: { dailyUsd: 0.003, onExceed: "block" } });
+	let calls = 0;
+	f.ctx.providers.set("openai", { streamSimple: () => { calls++; return streamFromEvents([doneEvent("ok")]); } });
+	try {
+		await f.pi.emit("session_start", { type: "session_start", reason: "startup" }, f.ctx);
+		await f.pi.commands.get("auto-model")!.handler("plan hello", f.ctx);
+		assert.match(f.ctx.notifications.at(-1)!, /Target: openai\/gpt-5/);
+		assert.equal(calls, 0);
+		await f.pi.emit("before_agent_start", { prompt: "hello" }, f.ctx);
+		assert.equal(routeNotices(f).length, 1);
+		assert.equal((await dispatch(f)).at(-1)?.type, "done");
+		const budget = JSON.parse(await readFile(join(f.root, ".pi/agent/auto-model/budget.json"), "utf8"));
+		assert.ok(budget.usage.dailyUsd > 0.0016 && budget.usage.dailyUsd < 0.0017);
+		assert.equal((await dispatch(f)).at(-1)?.type, "error");
+		assert.equal(calls, 1);
+	} finally { f.restore(); }
+});
+
+test("a damaged budget at startup is backed up, reported once and does not stop dispatch", async () => {
+	const f = await setup({ budget: { dailyUsd: 1, onExceed: "block" } });
+	const directory = join(f.root, ".pi/agent/auto-model");
+	const path = join(directory, "budget.json");
+	await mkdir(directory, { recursive: true });
+	await writeFile(path, "{broken");
+	let calls = 0;
+	for (const provider of ["openai", "anthropic"]) f.ctx.providers.set(provider, {
+		streamSimple: () => { calls++; return streamFromEvents([doneEvent("ok")]); },
+	});
+	try {
+		await begin(f);
+		assert.equal((await dispatch(f)).at(-1)?.type, "done");
+		assert.equal(calls, 1);
+		assert.equal(f.ctx.notifications.filter((message) => /budget ledger/i.test(message)).length, 1);
+		assert.ok((await readdir(directory)).some((name) => name.startsWith("budget.json.corrupt-")));
+		assert.equal(JSON.parse(await readFile(path, "utf8")).version, 1);
+	} finally { f.restore(); }
+});
+
+test("classifier and compaction use resolved prices before the first routed request", async () => {
+	for (const source of ["override", "cache"]) {
+		const f = await setup({ constraints: { providerAllow: ["openai"] }, classifier: { enabled: true },
+			pricing: { litellm: { enabled: false }, overrides: source === "override" ? { "openai/gpt-5": { input: 0, output: 0 } } : {} },
+			budget: { dailyUsd: 0, onExceed: "block" } });
+		if (source === "cache") {
+			await mkdir(join(f.root, ".pi/agent/auto-model"), { recursive: true });
+			await writeFile(join(f.root, ".pi/agent/auto-model/prices.json"), JSON.stringify({
+				version: 1, source: "litellm", updatedAt: Date.now(), models: { "openai/gpt-5": { input: 0, output: 0 } },
+			}));
+		}
+		let classified = 0;
+		let compacted = 0;
+		(f.ctx.modelRegistry as any).complete = async () => {
+			classified++;
+			return { content: [{ type: "text", text: '{"complexity":0.2}' }] };
+		};
+		f.ctx.providers.set("openai", { streamSimple: () => {
+			compacted++;
+			const done = doneEvent("Summary") as Extract<AssistantMessageEvent, { type: "done" }>;
+			done.message.stopReason = "stop";
+			return streamFromEvents([done]);
+		} });
+		try {
+			await begin(f);
+			assert.equal(classified, 1, source);
+			const result = await f.pi.emit("session_before_compact", compactionEvent(true), f.ctx);
+			assert.ok(result?.compaction, source);
+			assert.equal(compacted, 2, source);
+			const budget = JSON.parse(await readFile(join(f.root, ".pi/agent/auto-model/budget.json"), "utf8"));
+			assert.equal(budget.usage.dailyUsd, 0, source);
+		} finally { f.restore(); }
+	}
+});
+
+test("failover reserves each provider at its own override price", async () => {
+	const f = await setup({ policy: "cost", pricing: { litellm: { enabled: false }, overrides: {
+		"openai/gpt-5": { input: 0.1, output: 0.1 }, "anthropic/claude-sonnet": { input: 0.2, output: 0.2 },
+	} }, budget: { dailyUsd: 0.006, onExceed: "block" } });
+	const calls: string[] = [];
+	f.ctx.providers.set("openai", { streamSimple: () => {
+		calls.push("openai");
+		return streamFromEvents([{ type: "error", reason: "error", error: {
+			role: "assistant", content: [], errorMessage: "503 unavailable",
+		} as unknown as AssistantMessage }]);
+	} });
+	f.ctx.providers.set("anthropic", { streamSimple: () => {
+		calls.push("anthropic");
+		return streamFromEvents([doneEvent("ok")]);
+	} });
+	try {
+		await begin(f);
+		assert.equal((await dispatch(f)).at(-1)?.type, "done");
+		assert.deepEqual(calls, ["openai", "anthropic"]);
+		const budget = JSON.parse(await readFile(join(f.root, ".pi/agent/auto-model/budget.json"), "utf8"));
+		assert.ok(budget.usage.providers.openai.dailyUsd > 0.0016 && budget.usage.providers.openai.dailyUsd < 0.0017);
+		assert.equal(budget.usage.providers.anthropic.dailyUsd, 2 * budget.usage.providers.openai.dailyUsd);
+	} finally { f.restore(); }
+});
 
 test("never sends a request when every provider is denied", async () => {
 	const f = await setup({ constraints: { providerAllow: ["unavailable"] } });

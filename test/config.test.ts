@@ -19,6 +19,22 @@ test("loads configuration with safe defaults", async () => {
 	assert.deepEqual(config.pools, {});
 });
 
+test("validates the total request timeout and preserves project overrides", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "auto-model-timeout-"));
+	const file = join(dir, "auto-model.json");
+	await writeFile(file, JSON.stringify({ failover: { maxAttempts: 2, requestTimeoutMs: 120000 } }));
+	const base = await loadConfig(file);
+	assert.equal(base.failover.requestTimeoutMs, 120000);
+	await writeFile(file, JSON.stringify({ failover: { requestTimeoutMs: 30000 } }));
+	assert.equal(mergeConfig(base, await loadConfig(file, base)).failover.requestTimeoutMs, 30000);
+	for (const invalid of [0, -1, 0.5, 2_147_483_648, "30000"]) {
+		await writeFile(file, JSON.stringify({ failover: { requestTimeoutMs: invalid } }));
+		const config = await loadConfig(file);
+		assert.equal(config.failover.requestTimeoutMs, undefined);
+		assert.ok(config.diagnostics?.length);
+	}
+});
+
 test("allows a project or global config to disable automatic activation", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "auto-model-"));
 	const file = join(dir, "auto-model.json");

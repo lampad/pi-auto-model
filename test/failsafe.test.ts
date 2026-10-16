@@ -125,12 +125,14 @@ test("carries failover.firstOutputTimeoutMs into the fallback request", () => {
 		...baseArgs(),
 		config: {
 			...DEFAULT_CONFIG,
-			failover: { maxAttempts: 3, firstOutputTimeoutMs: 60_000 },
+			failover: { maxAttempts: 3, firstOutputTimeoutMs: 60_000, requestTimeoutMs: 120_000 },
 		},
 	};
 	const plan = buildFallbackPending(args);
 	assert.ok(plan);
 	assert.equal(plan.firstOutputTimeoutMs, 60_000);
+	assert.equal(plan.requestTimeoutMs, 120_000);
+	assert.equal(plan.maxAttempts, 3);
 });
 
 test("leaves firstOutputTimeoutMs off when the config does not set it", () => {

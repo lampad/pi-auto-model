@@ -3,6 +3,7 @@ import { deriveCapabilityPrior, type CapabilityOptions } from "../models/capabil
 import type { TaskProfile, TaskKind, CapabilityTier, CandidateConstraints } from "../types.ts";
 import { resolvePiCandidates } from "../pi/registry-adapter.ts";
 import type { BudgetLedger, BudgetConfig } from "../budget/budget.ts";
+import type { ResolvedModelPrice } from "../pricing/price-catalog.ts";
 
 export function shouldClassify(profile: TaskProfile, enabled: boolean, threshold: number): boolean {
 	return enabled && profile.confidence < threshold;
@@ -161,7 +162,7 @@ export async function refineWithClassifier(
 	timeoutMs: number,
 	capabilityOptions?: CapabilityOptions,
 	constraints: CandidateConstraints = {},
-	budget?: { ledger: BudgetLedger; config: BudgetConfig; onCost: (cost: number) => void },
+	budget?: { ledger: BudgetLedger; config: BudgetConfig; onCost: (cost: number, reconciled?: boolean) => void; prices?: ReadonlyMap<string, ResolvedModelPrice> },
 ): Promise<TaskProfile> {
 	const model = resolvePiCandidates(ctx, constraints).targets.map((target) => target.model)
 		.filter((candidate) => candidate.input.includes("text"))
@@ -177,8 +178,9 @@ Task: ${prompt.slice(0, 1200)}`;
 		content: [{ type: "text" as const, text: classifierPrompt }],
 		timestamp: Date.now(),
 	};
+	const price = budget?.prices?.get(`${model.provider}/${model.id}`) ?? model.cost;
 	const reservation = { provider: model.provider, sessionId: ctx.sessionManager.getSessionId(),
-		at: Date.now(), estimate: (Math.ceil(classifierPrompt.length / 3) * model.cost.input + 128 * model.cost.output) / 1_000_000 };
+		at: Date.now(), estimate: (Math.ceil(classifierPrompt.length / 3) * price.input + 128 * price.output) / 1_000_000 };
 	if (budget) {
 		const decision = await budget.ledger.reserve(model.provider, reservation.estimate, budget.config, reservation.at, reservation.sessionId);
 		if (decision.action === "block" || decision.action === "avoid") return profile;
@@ -201,7 +203,7 @@ Task: ${prompt.slice(0, 1200)}`;
 	const actual = result.usage?.cost?.total;
 	if (budget && typeof actual === "number" && Number.isFinite(actual) && actual > 0) {
 		await budget.ledger.reconcile(reservation, actual);
-		budget.onCost(actual - reservation.estimate);
+		budget.onCost(actual - reservation.estimate, true);
 	}
 	const text = result.content
 		.filter((part): part is { type: "text"; text: string } => part.type === "text")

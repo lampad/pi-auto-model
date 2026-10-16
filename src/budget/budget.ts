@@ -133,18 +133,56 @@ export class BudgetLedger {
 	private filePath?: string;
 	private loaded = false;
 	private writeChain: Promise<void> = Promise.resolve();
+	private pendingWarning?: string;
+	private readonly reportedWarnings = new Set<string>();
 
 	async load(filePath: string, now = Date.now()): Promise<void> {
 		this.filePath = filePath;
 		if (this.loaded) return;
+		await this.reloadUsage(filePath, now);
 		this.loaded = true;
+	}
+
+	/** Returns a ledger problem not yet shown to the user; each distinct problem is reported once. */
+	takeWarning(): string | undefined {
+		const warning = this.pendingWarning;
+		this.pendingWarning = undefined;
+		return warning;
+	}
+
+	private warn(message: string): void {
+		if (this.reportedWarnings.has(message)) return;
+		this.reportedWarnings.add(message);
+		this.pendingWarning = message;
+	}
+
+	private reserveInMemory(provider: string, estimate: number, config: BudgetConfig, now: number, sessionId?: string): BudgetDecision {
+		if (sessionId) this.startSession(sessionId, now);
+		const decision = this.evaluate(estimate, provider, config, now);
+		if (decision.action !== "block" && decision.action !== "avoid") this.record(provider, estimate, now);
+		return decision;
+	}
+
+	/** Budget tracking must never stop routing: shared-file failures fall back to in-memory usage. */
+	private async withSharedLedger(filePath: string, action: () => Promise<void>, fallback: () => void): Promise<void> {
+		let entered = false;
 		try {
-			const parsed = JSON.parse(await readFile(filePath, "utf8")) as Partial<BudgetFile>;
-			if (parsed.version === 1 && parsed.usage) {
-				this.usage = normalizeUsage(parsed.usage, now);
-			}
-		} catch {
-			this.usage = createUsage(now);
+			await mkdir(dirname(filePath), { recursive: true });
+			await withFileLock(`${filePath}.lock`, async () => {
+				entered = true;
+				await action();
+			});
+		} catch (error) {
+			this.warn(`Pi Auto Model: shared budget ledger ${filePath} is unavailable (${errorText(error)}); budget tracking continues in memory.`);
+			if (!entered) fallback();
+		}
+	}
+
+	private async persistSafely(now: number): Promise<void> {
+		try {
+			await this.persist(now);
+		} catch (error) {
+			this.warn(`Pi Auto Model: cannot save budget ledger ${this.filePath} (${errorText(error)}); budget tracking continues in memory.`);
 		}
 	}
 
@@ -155,29 +193,23 @@ export class BudgetLedger {
 		now = Date.now(),
 		sessionId = this.usage.sessionKey,
 	): Promise<BudgetDecision> {
-		if (!this.filePath) {
-			if (sessionId) this.startSession(sessionId, now);
-			const decision = this.evaluate(estimate, provider, config, now);
-			if (decision.action !== "block" && decision.action !== "avoid") this.record(provider, estimate, now);
-			return decision;
-		}
+		if (!this.filePath) return this.reserveInMemory(provider, estimate, config, now, sessionId);
 		await this.writeChain.catch(() => {});
 		const filePath = this.filePath;
-		await mkdir(dirname(filePath), { recursive: true });
-		return withFileLock(`${filePath}.lock`, async () => {
-			const sessionKey = sessionId;
+		let decision!: BudgetDecision;
+		await this.withSharedLedger(filePath, async () => {
 			await this.reloadUsage(filePath, now);
-			if (sessionKey) {
-				this.usage.sessionKey = sessionKey;
-				this.usage.sessionUsd = this.usage.sessions?.[sessionKey] ?? 0;
+			if (sessionId) {
+				this.usage.sessionKey = sessionId;
+				this.usage.sessionUsd = this.usage.sessions?.[sessionId] ?? 0;
 			}
-			const decision = this.evaluate(estimate, provider, config, now);
+			decision = this.evaluate(estimate, provider, config, now);
 			if (decision.action !== "block" && decision.action !== "avoid") {
 				this.record(provider, estimate, now);
-				await this.persist(now);
+				await this.persistSafely(now);
 			}
-			return decision;
-		});
+		}, () => { decision = this.reserveInMemory(provider, estimate, config, now, sessionId); });
+		return decision;
 	}
 
 	/** Replace one reservation with observed cost, in its original accounting windows. */
@@ -209,19 +241,18 @@ export class BudgetLedger {
 		if (!this.filePath) return apply();
 		const filePath = this.filePath;
 		await this.writeChain.catch(() => {});
-		await withFileLock(`${filePath}.lock`, async () => {
+		await this.withSharedLedger(filePath, async () => {
 			await this.reloadUsage(filePath, now);
 			apply();
-			await this.persist(now);
-		});
+			await this.persistSafely(now);
+		}, apply);
 	}
 
 	async recordShared(provider: string, estimate: number, now = Date.now()): Promise<void> {
 		if (!this.filePath) return this.record(provider, estimate, now);
 		await this.writeChain.catch(() => {});
 		const filePath = this.filePath;
-		await mkdir(dirname(filePath), { recursive: true });
-		await withFileLock(`${filePath}.lock`, async () => {
+		await this.withSharedLedger(filePath, async () => {
 			const sessionKey = this.usage.sessionKey;
 			await this.reloadUsage(filePath, now);
 			if (sessionKey) {
@@ -229,8 +260,8 @@ export class BudgetLedger {
 				this.usage.sessionUsd = this.usage.sessions?.[sessionKey] ?? 0;
 			}
 			this.record(provider, estimate, now);
-			await this.persist(now);
-		});
+			await this.persistSafely(now);
+		}, () => this.record(provider, estimate, now));
 	}
 
 	startSession(sessionKey: string, now = Date.now()): void {
@@ -314,13 +345,29 @@ export class BudgetLedger {
 		await rename(temporaryPath, this.filePath);
 	}
 
+	/** Never throws: unreadable or damaged ledgers keep the in-memory usage instead of resetting it. */
 	private async reloadUsage(filePath: string, now: number): Promise<void> {
+		let text: string;
 		try {
-			const parsed = JSON.parse(await readFile(filePath, "utf8")) as Partial<BudgetFile>;
-			this.usage = parsed.version === 1 && parsed.usage ? normalizeUsage(parsed.usage, now) : createUsage(now);
-		} catch {
-			this.usage = createUsage(now);
+			text = await readFile(filePath, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				this.usage = createUsage(now);
+				return;
+			}
+			this.warn(`Pi Auto Model: cannot read budget ledger ${filePath} (${errorText(error)}); budget tracking continues in memory.`);
+			return;
 		}
+		const usage = parseLedger(text, now);
+		if (usage) {
+			this.usage = usage;
+			return;
+		}
+		const backupPath = `${filePath}.corrupt-${now}`;
+		const moved = await rename(filePath, backupPath).then(() => true, () => false);
+		// Rewrite at once: a missing ledger would otherwise read as "no spend" on the next reload.
+		if (moved) await this.persistSafely(now);
+		this.warn(`Pi Auto Model: budget ledger ${filePath} was damaged${moved ? ` and was saved as ${backupPath}` : ""}; budget tracking continues from in-memory usage.`);
 	}
 
 	private rotate(now: number): void {
@@ -357,38 +404,68 @@ function localPeriodKeys(now: number): Pick<BudgetUsageSnapshot, "dayKey" | "mon
 	return { monthKey, dayKey: `${monthKey}-${String(date.getDate()).padStart(2, "0")}` };
 }
 
-function normalizeUsage(value: BudgetUsageSnapshot, now: number): BudgetUsageSnapshot {
-	const fresh = createUsage(now);
+function errorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isAmount(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function parseLedger(text: string, now: number): BudgetUsageSnapshot | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+	if (!isRecord(parsed) || parsed.version !== 1) return undefined;
+	return normalizeUsage(parsed.usage, now);
+}
+
+/**
+ * Only the period keys and period totals are required; a ledger without them
+ * cannot be trusted. Optional or per-entry fields that are invalid are dropped
+ * individually so one bad entry does not discard the whole ledger.
+ */
+function normalizeUsage(value: unknown, now: number): BudgetUsageSnapshot | undefined {
+	if (!isRecord(value) || typeof value.dayKey !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value.dayKey) ||
+		value.dayKey.slice(0, 7) !== value.monthKey || !isAmount(value.dailyUsd) || !isAmount(value.monthlyUsd)) {
+		return undefined;
+	}
 	const usage: BudgetUsageSnapshot = {
-		dayKey: typeof value.dayKey === "string" ? value.dayKey : fresh.dayKey,
-		monthKey: typeof value.monthKey === "string" ? value.monthKey : fresh.monthKey,
+		...createUsage(now),
+		dayKey: value.dayKey,
+		monthKey: value.dayKey.slice(0, 7),
 		sessionKey: typeof value.sessionKey === "string" ? value.sessionKey : undefined,
-		sessionUsd: typeof value.sessionUsd === "number" ? Math.max(0, value.sessionUsd) : 0,
-		sessions: Object.fromEntries(
-			Object.entries(value.sessions ?? {})
-				.filter(([, amount]) => typeof amount === "number")
-			.map(([key, amount]) => [key, Math.max(0, amount as number)]),
-		),
-		dailyUsd: typeof value.dailyUsd === "number" ? Math.max(0, value.dailyUsd) : 0,
-		monthlyUsd: typeof value.monthlyUsd === "number" ? Math.max(0, value.monthlyUsd) : 0,
+		sessionUsd: isAmount(value.sessionUsd) ? value.sessionUsd : 0,
+		sessions: Object.fromEntries(Object.entries(isRecord(value.sessions) ? value.sessions : {})
+			.filter((entry): entry is [string, number] => isAmount(entry[1]))),
+		dailyUsd: value.dailyUsd,
+		monthlyUsd: value.monthlyUsd,
 		providers: {},
 		history: Array.isArray(value.history)
 			? value.history
 				.filter((entry): entry is BudgetUsageBucket =>
-					Boolean(entry) && typeof entry.startAt === "number" && typeof entry.usd === "number",
-				)
+					isRecord(entry) && typeof entry.startAt === "number" && Number.isFinite(entry.startAt) && isAmount(entry.usd))
 				.map((entry) => ({
 					startAt: entry.startAt,
-					usd: Math.max(0, entry.usd),
-					providers: { ...entry.providers },
+					usd: entry.usd,
+					providers: Object.fromEntries(Object.entries(isRecord(entry.providers) ? entry.providers : {})
+						.filter((item): item is [string, number] => isAmount(item[1]))),
 				}))
 				.slice(-24 * 90)
 			: [],
 	};
-	for (const [provider, limits] of Object.entries(value.providers ?? {})) {
+	for (const [provider, limits] of Object.entries(isRecord(value.providers) ? value.providers : {})) {
+		if (!isRecord(limits)) continue;
 		usage.providers[provider] = {
-			dailyUsd: Math.max(0, limits.dailyUsd ?? 0),
-			monthlyUsd: Math.max(0, limits.monthlyUsd ?? 0),
+			dailyUsd: isAmount(limits.dailyUsd) ? limits.dailyUsd : 0,
+			monthlyUsd: isAmount(limits.monthlyUsd) ? limits.monthlyUsd : 0,
 		};
 	}
 	return usage;

@@ -46,6 +46,7 @@
   "files": [
     "extensions",
     "src",
+    "docs/task-evaluation.md",
     "LICENSE",
     "README.md",
     "package.json",
@@ -60,6 +61,7 @@
   "scripts": {
     "typecheck": "node ./node_modules/typescript/lib/tsc.js --noEmit",
     "test": "node --experimental-strip-types --test test/**/*.test.ts",
+    "eval:tasks": "node --experimental-strip-types src/evaluation/task-eval.ts",
     "check": "npm run typecheck && npm test",
     "pack:check": "npm pack --dry-run",
     "prepublishOnly": "npm run check && npm run pack:check"

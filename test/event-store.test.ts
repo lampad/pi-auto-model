@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import { UnifiedEventStore } from "../src/observability/event-store.ts";
 
 test("persists, queries, and exports correlated events", async () => {
@@ -43,4 +45,37 @@ test("compacts persisted history and recovers after a transient write failure", 
 	recovering.record({ id: "recovered", kind: "request", at: 2 });
 	await recovering.flush();
 	assert.match(await readFile(join(blocker, "events.jsonl"), "utf8"), /recovered/);
+});
+
+test("batches queued events and still loads history when the lock stays busy", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "auto-model-events-busy-"));
+	const path = join(dir, "events.jsonl");
+	const store = new UnifiedEventStore(path);
+	for (let at = 0; at < 50; at++) store.record({ id: `e${at}`, kind: "request", at });
+	await store.flush();
+	assert.equal((await readFile(path, "utf8")).trim().split("\n").length, 50);
+	await writeFile(`${path}.lock`, "held by another process");
+	const restored = new UnifiedEventStore(path);
+	await restored.load();
+	assert.equal(restored.query({ limit: 100 }).length, 50);
+});
+
+test("rollover preserves the newest events from another writer", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "auto-model-events-shared-"));
+	const path = join(dir, "events.jsonl");
+	const first = new UnifiedEventStore(path, 2);
+	await first.load();
+	for (let at = 0; at < 4; at++) first.record({ id: `a${at}`, kind: "request", at });
+	await first.flush();
+	await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", `
+		import { UnifiedEventStore } from ${JSON.stringify(new URL("../src/observability/event-store.ts", import.meta.url).href)};
+		const store = new UnifiedEventStore(process.argv[1], 2);
+		await store.load();
+		store.record({ id: "b4", kind: "request", at: 4 });
+		await store.flush();
+	`, path]);
+	first.record({ id: "a5", kind: "request", at: 5 });
+	await first.flush();
+	const lines = (await readFile(path, "utf8")).trim().split("\n").map((line) => JSON.parse(line).id);
+	assert.deepEqual(lines, ["b4", "a5"]);
 });

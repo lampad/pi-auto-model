@@ -157,6 +157,8 @@ All commands use the `/auto-model` namespace.
 | `/auto-model off` | Disable automatic routing for this session |
 | `/auto-model status` | Show activation, current model, last route, policy, and pool |
 | `/auto-model why` | Explain the latest routing decision |
+| `/auto-model task` | Inspect the latest settled task's cost, duration, outcome and escalation |
+| `/auto-model outcome success\|failure\|unknown` | Record your assessment of the latest settled task |
 | `/auto-model models` | List eligible models |
 | `/auto-model providers` | List eligible providers |
 | `/auto-model history` | Show recent routing decisions |
@@ -383,6 +385,8 @@ The `cost` policy ranks models by the estimated cost of *this request* — `max(
 
 Catalog price matching is heuristic: exact `provider/model`, provider aliases (`google` ↔ `gemini`), and versioned keys (`claude-sonnet-4` ↔ `anthropic/claude-sonnet-4-20250514`). When the match is wrong, pin the price with an override — overrides are always authoritative.
 
+Budget reservations use the same resolved input/output prices as route planning, including overrides and the cached catalog, for main requests, retries, tool-loop continuations, classifiers, and compaction. Routing multipliers (`costCoef`) do not alter those reservations. Positive reported usage costs still reconcile the reserved estimate.
+
 #### `pool`
 
 `pool` selects a configured weighted pool by default. A session can override it with:
@@ -479,7 +483,9 @@ Input token counts remain heuristic, especially for images and tool schemas. Thi
 
 #### `failover`
 
-`maxAttempts` bounds next-task failover attempts. Same-request failover is handled separately by the stream proxy, which iterates through the ranked target list within a single request before any substantive output is flushed. A response that has already streamed content or invoked tools is marked unsafe and is not automatically replayed.
+`maxAttempts` (default `3`) bounds dispatched attempts per stream request, including the initial target, as well as next-task fallback selection. Candidates skipped for policy, authentication, or circuit state do not consume a dispatch attempt. Each tool-loop continuation gets a new request limit. A response that has already streamed content or invoked tools is marked unsafe and is not automatically replayed.
+
+`requestTimeoutMs` optionally bounds the whole stream request across all attempts, including authentication, policy checks, and streaming. On expiry the caller receives an error and the provider is aborted; a provider that ignores cancellation cannot cause a late fallback dispatch. This timeout also applies after partial output, which is preserved and never replayed. It is off by default to preserve long-running reasoning requests. For example: `"failover": { "maxAttempts": 3, "firstOutputTimeoutMs": 60000, "requestTimeoutMs": 180000 }`. Cancellation cannot guarantee that an upstream provider stops billing; reservations remain until reported cost is available.
 
 `firstOutputTimeoutMs` adds an optional fail-safe on top of `maxAttempts`: when a target produces no substantive output (text or tool call) within the window, the stream proxy treats it as a pre-output failure and fails over to the next ranked target. It is off by default, because reasoning-capable models may legitimately think for a long time before the first token; set it explicitly to cap silent hangs, for example `"failover": { "maxAttempts": 3, "firstOutputTimeoutMs": 120000 }`. The guard never fires after output has reached the user.
 
@@ -755,12 +761,16 @@ Global budget usage is stored locally:
 ~/.pi/agent/auto-model/budget.json
 ```
 
+A missing budget file initializes a new ledger. Budget-file problems never block requests. Invalid optional entries (a single provider, session, or history record) are dropped and the rest of the ledger is kept. A malformed or unsupported ledger is moved aside as `budget.json.corrupt-<timestamp>`, and tracking continues from the usage already held in memory (empty if Pi just started). If the file cannot be read or written, budget tracking continues in memory for this process. Each problem is reported once as a warning that names the file. To recover earlier spending, restore the backed-up file.
+
 Unified request, route, provider response, quota, budget, failover, and feedback events are stored locally:
 
 ```text
 ~/.pi/agent/auto-model/events.jsonl
 ~/.pi/agent/auto-model/quality.json
 ```
+
+Event appends and history rotation share a file lock across Pi processes. Rotation retains the latest on-disk records and atomically replaces the file, so another process's recent events are not overwritten by a stale in-memory snapshot.
 
 Stored metrics include:
 
@@ -773,13 +783,25 @@ Stored metrics include:
 - aggregate Provider statistics.
 - hourly attempts by target, success rate, latency, cost, rate limits, and failovers.
 
-Metrics and learned quality updates use a cross-process file lock so concurrent Pi sessions merge their deltas instead of overwriting one another. Learned success is recorded when the whole agent turn settles, including tool-call errors, rather than when an intermediate provider stream finishes.
+Metrics and learned reliability updates use a cross-process file lock so concurrent Pi sessions merge their deltas instead of overwriting one another. New delivery observations are recorded per provider attempt; user cancellations and tool-call errors are not model-delivery failures. Explicit feedback remains a separate preference signal. Existing historical learning data is retained and continues to decay.
 
 Provider quota/UVI state is derived from these local metrics and recent rate-limit response headers. Run `/auto-model quota` or `/auto-model doctor` to inspect it.
 Run `/auto-model metrics` for the last 24 hourly buckets and `/auto-model budget` for the current budget ledger.
 
 Per-model and per-provider metrics also report TTFT p50/p95 when samples are available. Here TTFT means time from provider invocation to the first text or tool-call output; buffered thinking is not counted as first output. Main-task cost events carry a unique attempt ID and the actual target, so failed and successful failover attempts are not lumped under the initial planned model.
 Run `/auto-model history` for persisted route decisions and `/auto-model export json` to export unified events.
+
+### Task outcomes and recovery
+
+`/auto-model task` shows the latest settled automatic task in this session. A task is one routed agent run, not an entire multi-turn project. Its cost includes reserved/reconciled main attempts, classifier calls, and compaction calls made during that run. Any unknown cost keeps the total labeled **estimated**. Compaction outside an active run remains in the budget ledger but is not attributed to a previous task.
+
+Successful model delivery leaves the task outcome **unknown**. A terminal provider error records **failure**, and cancellation records **cancelled**. Use `/auto-model outcome success|failure|unknown` after checking the result; this records a separate user assessment and does not pretend to be independent test evidence. Summaries and assessments are included in event exports; normal history retention still applies.
+
+Provider delivery reliability is learned separately from tool failures. Environment problems (such as missing commands or permission errors), ordinary test/assertion failures, and unclassified failures do not trigger capability upgrades. Two consecutive recognized execution mistakes from the same tool (such as edit-text mismatches or invalid arguments) can upgrade the next call once per task, only to a strictly stronger eligible target. Successful tool execution resets the streak. Existing scope, pins, budget and compatibility checks still apply at dispatch. Failure classification is a conservative text heuristic, not a verdict on task quality.
+
+### Paired task evaluation
+
+Run `npm run eval:tasks -- path/to/runs.jsonl` to compare independently accepted tasks against a fixed-model baseline. This command only reads local results; it never calls a provider or executes acceptance commands. It rejects unpaired task/revision records and suppresses cost or quality comparisons when costs or outcomes are unknown. See [the real-task evaluation procedure](docs/task-evaluation.md) for inputs and acceptance rules. The included fixture is synthetic and is not evidence of savings.
 
 The extension does not send remote telemetry. Records do not contain full prompts, repository contents, tool output, or authentication secrets. When the optional classifier is enabled, only a short prompt excerpt is sent through the selected authenticated Pi model.
 

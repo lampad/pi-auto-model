@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -123,4 +123,60 @@ test("reconciles reservations across processes, sessions and month boundaries", 
 	assert.equal(usage.sessions?.s2, 2);
 	assert.equal(usage.history?.[0].usd, 0.25);
 	assert.equal(evaluateBudget(0.1, { maxUsdPerTask: 0, onExceed: "block" }), "block");
+});
+
+test("damaged ledgers are backed up and never reset spent budget or stop routing", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-budget-damaged-"));
+	const path = join(directory, "budget.json");
+	const ledger = new BudgetLedger();
+	await ledger.load(path);
+	await ledger.reserve("openai", 1, { dailyUsd: 1, onExceed: "block" });
+	const valid = await readFile(path, "utf8");
+	for (const damaged of ["{broken", "null", '{"version":2}', '{"version":1,"usage":{}}',
+		valid.replace('"dailyUsd": 1', '"dailyUsd": "invalid"')]) {
+		await writeFile(path, damaged);
+		const fresh = new BudgetLedger();
+		await fresh.load(path);
+		assert.match(fresh.takeWarning() ?? "", /damaged/);
+		assert.equal(fresh.snapshot().dailyUsd, 0);
+		await writeFile(path, damaged);
+		assert.equal((await ledger.reserve("openai", 0.1, { dailyUsd: 1, onExceed: "block" })).action, "block");
+		assert.equal(ledger.snapshot().dailyUsd, 1);
+	}
+	assert.match(ledger.takeWarning() ?? "", /damaged/);
+	assert.equal(ledger.takeWarning(), undefined, "each distinct problem is reported once");
+	assert.ok((await readdir(directory)).some((name) => name.startsWith("budget.json.corrupt-")));
+	assert.equal(JSON.parse(await readFile(path, "utf8")).usage.dailyUsd, 1, "next write restores a valid ledger");
+});
+
+test("salvages valid fields when only optional ledger entries are damaged", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-budget-salvage-"));
+	const path = join(directory, "budget.json");
+	const ledger = new BudgetLedger();
+	await ledger.load(path);
+	await ledger.reserve("openai", 0.5, {});
+	const file = JSON.parse(await readFile(path, "utf8"));
+	file.usage.providers.broken = "invalid";
+	file.usage.sessions = { good: 0.2, bad: "x" };
+	await writeFile(path, JSON.stringify(file));
+	const reloaded = new BudgetLedger();
+	await reloaded.load(path);
+	assert.equal(reloaded.takeWarning(), undefined);
+	assert.equal(reloaded.snapshot().dailyUsd, 0.5);
+	assert.equal(reloaded.snapshot().providers.openai.dailyUsd, 0.5);
+	assert.equal(reloaded.snapshot().providers.broken, undefined);
+	assert.deepEqual(reloaded.snapshot().sessions, { good: 0.2 });
+});
+
+test("an unusable ledger path keeps budget tracking in memory without throwing", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-budget-unreadable-"));
+	const unreadable = join(directory, "directory");
+	await mkdir(unreadable);
+	const ledger = new BudgetLedger();
+	await ledger.load(unreadable);
+	assert.match(ledger.takeWarning() ?? "", /budget ledger/);
+	assert.equal((await ledger.reserve("openai", 1, { dailyUsd: 1.5, onExceed: "block" })).action, "allow");
+	assert.equal((await ledger.reserve("openai", 1, { dailyUsd: 1.5, onExceed: "block" })).action, "block");
+	await ledger.reconcile({ provider: "openai", estimate: 1, at: Date.now(), sessionId: "s" }, 0.25);
+	assert.equal(ledger.snapshot().dailyUsd, 0.25);
 });

@@ -7,6 +7,7 @@ import type { CircuitBreaker } from "../health/circuit-breaker.ts";
 import { analyzeTask } from "../task/local-analyzer.ts";
 import { resolvePiCandidates } from "./registry-adapter.ts";
 import { createStreamProxyHandler } from "./stream-proxy.ts";
+import type { ResolvedModelPrice } from "../pricing/price-catalog.ts";
 
 export async function handleBeforeCompact(
 	event: SessionBeforeCompactEvent,
@@ -15,15 +16,22 @@ export async function handleBeforeCompact(
 	config: AutoModelConfig,
 	budget: BudgetLedger,
 	circuits: CircuitBreaker,
+	prices?: ReadonlyMap<string, ResolvedModelPrice>,
+	onCost?: (cost: number, reconciled?: boolean) => void,
 ): Promise<{ cancel: true } | { compaction: CompactionResult } | undefined> {
 	if (state.activation !== "active") return;
 	if (event.signal?.aborted) return { cancel: true };
 	const targets = resolvePiCandidates(ctx, config.constraints).targets
 		.filter(({ model, id }) => !circuits.isOpen(id) && model.input.includes("text") &&
 			model.contextWindow > event.preparation.tokensBefore + Math.min(model.maxTokens, event.preparation.settings.reserveTokens))
-		.sort((a, b) => (a.model.cost.input + a.model.cost.output) - (b.model.cost.input + b.model.cost.output));
+		.sort((a, b) => {
+			const left = prices?.get(a.id) ?? a.model.cost;
+			const right = prices?.get(b.id) ?? b.model.cost;
+			return (left.input + left.output) - (right.input + right.output);
+		});
 	const target = targets[0];
 	if (!target) return { cancel: true };
+	const price = prices?.get(target.id) ?? target.model.cost;
 	let spent = 0;
 	// Pi captures the native request model before this hook; setModel here cannot reroute it.
 	// Return Pi's own compaction result, preserving split turns and file-operation tracking.
@@ -37,12 +45,13 @@ export async function handleBeforeCompact(
 				getRegistry: () => ctx.modelRegistry,
 				circuits,
 				getPendingStream: () => ({ targets: [target], profile, thinking: "off", requestId: randomUUID(),
-					sessionId: state.sessionId, estimatedCostUsd: 0, apisUsed: [], firstOutputTimeoutMs: config.failover.firstOutputTimeoutMs }),
+					sessionId: state.sessionId, estimatedCostUsd: 0, apisUsed: [], firstOutputTimeoutMs: config.failover.firstOutputTimeoutMs,
+					maxAttempts: config.failover.maxAttempts, requestTimeoutMs: config.failover.requestTimeoutMs }),
 				beforeAttempt: async () => {
 					// ponytail: text/JSON heuristic; use a tokenizer if measured underestimation warrants it.
 					const inputTokens = Math.ceil(JSON.stringify(context).length / 3);
 					if (inputTokens + outputTokens >= target.model.contextWindow) return false;
-					const estimate = (inputTokens * target.model.cost.input + outputTokens * target.model.cost.output) / 1_000_000;
+					const estimate = (inputTokens * price.input + outputTokens * price.output) / 1_000_000;
 					const at = Date.now();
 					const limits = { ...config.budget, maxUsdPerTask: config.budget.maxUsdPerTask === undefined
 						? undefined : Math.max(0, config.budget.maxUsdPerTask - spent) };
@@ -50,13 +59,22 @@ export async function handleBeforeCompact(
 					if (decision.action === "block" || decision.action === "avoid") return false;
 					reservation = { provider: target.model.provider, estimate, at, sessionId: state.sessionId };
 					spent += estimate;
+					onCost?.(estimate);
 					return true;
 				},
-				onAttemptSettled: async ({ message }) => {
+				onAttemptSettled: async ({ message, notDispatched }) => {
+					if (reservation && notDispatched) {
+						await budget.reconcile(reservation, 0);
+						spent -= reservation.estimate;
+						onCost?.(-reservation.estimate, true);
+						reservation = undefined;
+						return;
+					}
 					const actual = message?.usage?.cost?.total;
 					if (reservation && typeof actual === "number" && Number.isFinite(actual) && actual > 0) {
 						await budget.reconcile(reservation, actual);
 						spent += actual - reservation.estimate;
+						onCost?.(actual - reservation.estimate, true);
 					}
 				},
 			});

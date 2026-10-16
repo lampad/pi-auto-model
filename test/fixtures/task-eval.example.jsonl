@@ -1,0 +1,2 @@
+{"taskId":"synthetic-example-only","revision":"fixture-v1","variant":"router","configId":"example-router","models":["fixture/cheap","fixture/strong"],"outcome":"success","evidence":"Synthetic fixture, not a real model run","costUsd":0.02,"durationMs":1200}
+{"taskId":"synthetic-example-only","revision":"fixture-v1","variant":"baseline","configId":"example-baseline","models":["fixture/strong"],"outcome":"success","evidence":"Synthetic fixture, not a real model run","costUsd":0.03,"durationMs":1000}
