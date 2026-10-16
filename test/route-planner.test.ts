@@ -27,6 +27,22 @@ const targets = [
 	target("openai/gpt-5.6-luna"),
 ];
 
+test("reserves the capped stream output allowance before ranking targets", () => {
+	const smaller = target("small");
+	const larger = target("large");
+	larger.model.contextWindow = 1_100_000;
+	const profile = analyzeTask({ prompt: "hello", contextTokens: 804_408 });
+	const plan = planRoute({ targets: [smaller, larger], profile, outputTokenLimit: 128_000 });
+	assert.deepEqual(plan?.rankedTargets.map((t) => t.id), [larger.id]);
+	// A small-output target must not be rejected for failing to emit 128k.
+	smaller.model.maxTokens = 16_000;
+	assert.ok(planRoute({ targets: [smaller], profile, outputTokenLimit: 128_000 }));
+	assert.ok(planRoute({ targets: [smaller], profile }), "core callers retain task-based requirements");
+	smaller.model.maxTokens = 128_000;
+	smaller.model.contextWindow = 1_053_069;
+	assert.equal(planRoute({ targets: [smaller], profile, outputTokenLimit: 128_000 }), undefined, "truly over-limit requests remain blocked");
+});
+
 test("prefers the low-cost light model for a simple request", () => {
 	const plan = planRoute({
 		targets,

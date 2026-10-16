@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutoModelConfig } from "../config/defaults.ts";
+import { AUTO_MODEL_MAX_TOKENS } from "./auto-model.ts";
 import { analyzeTask } from "../task/local-analyzer.ts";
 import { chooseThinkingLevel } from "../routing/thinking-router.ts";
 import { estimateCost } from "../budget/budget.ts";
@@ -67,6 +68,7 @@ export function buildFallbackPending(args: FallbackPendingArgs): PendingStreamRe
 	const pool = args.config.pool ? args.config.pools[args.config.pool] : undefined;
 	if (args.config.pool && !pool) return undefined;
 	let route = planRoute({
+		outputTokenLimit: AUTO_MODEL_MAX_TOKENS,
 		targets,
 		pool,
 		profile,
@@ -75,6 +77,7 @@ export function buildFallbackPending(args: FallbackPendingArgs): PendingStreamRe
 		capabilityOptions: { source: args.config.capabilitySource, overrides: args.config.benchmarkOverrides },
 	});
 	if (!route && pool?.fallback === "any") route = planRoute({
+		outputTokenLimit: AUTO_MODEL_MAX_TOKENS,
 		targets, profile, contextTokens: args.contextTokens,
 		capabilityOptions: { source: args.config.capabilitySource, overrides: args.config.benchmarkOverrides },
 	});

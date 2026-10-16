@@ -5,6 +5,7 @@ import type { AssistantMessageEventStream } from "@earendil-works/pi-ai";
 export const AUTO_MODEL_PROVIDER = "pi-auto-model";
 export const AUTO_MODEL_ID = "auto";
 export const AUTO_MODEL_TARGET_ID = `${AUTO_MODEL_PROVIDER}/${AUTO_MODEL_ID}`;
+export const AUTO_MODEL_MAX_TOKENS = 128_000;
 
 export function isAutoModel(model: Model<any> | undefined): boolean {
 	return model?.provider === AUTO_MODEL_PROVIDER && model.id === AUTO_MODEL_ID;
@@ -28,7 +29,7 @@ export function registerAutoModelProvider(
 				input: ["text", "image"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: 1_000_000,
-				maxTokens: 128_000,
+				maxTokens: AUTO_MODEL_MAX_TOKENS,
 			},
 		],
 	});

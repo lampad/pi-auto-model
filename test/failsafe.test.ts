@@ -39,6 +39,13 @@ function baseArgs() {
 	};
 }
 
+test("fallback reserves full per-target output capacity", () => {
+	const candidate = model("openai", "gpt-5", 1);
+	candidate.contextWindow = 1_050_000;
+	candidate.maxTokens = 128_000;
+	assert.equal(buildFallbackPending({ ...baseArgs(), ctx: makeCtx([candidate]), contextTokens: 804_408 }), undefined);
+});
+
 test("builds a fallback pending request from the available models", () => {
 	const plan = buildFallbackPending(baseArgs());
 	assert.ok(plan);

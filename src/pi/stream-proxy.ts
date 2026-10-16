@@ -74,8 +74,8 @@ export interface StreamProxyDeps {
 	getRegistry: () => ModelRegistry | undefined;
 	circuits: CircuitBreaker;
 	getPendingStream: (sessionId?: string) => PendingStreamRequest | undefined;
-	/** Called before a target is attempted. Return false to skip it. */
-	beforeAttempt?: (target: RouteTarget, request: PendingStreamRequest, context: Context) => boolean | Promise<boolean>;
+	/** Called before a target is attempted. Return false or a reason string to skip it. */
+	beforeAttempt?: (target: RouteTarget, request: PendingStreamRequest, context: Context) => boolean | string | Promise<boolean | string>;
 	/** Called when an attempt's HTTP response arrives (for quota/circuit updates). */
 	onAttemptResponse?: (target: RouteTarget, status: number, headers: Record<string, string>, request: PendingStreamRequest) => void;
 	/** Called after an attempt finishes (success or failure) for metrics/quality. */
@@ -150,7 +150,7 @@ function ignoreFailure(action: (() => void) | undefined): void {
 	}
 }
 
-async function allowOnFailure(action: (() => boolean | Promise<boolean>) | undefined): Promise<boolean> {
+async function allowOnFailure(action: (() => boolean | string | Promise<boolean | string>) | undefined): Promise<boolean | string> {
 	try {
 		return action ? await action() : true;
 	} catch {
@@ -358,9 +358,11 @@ async function runFailoverLoop(
 			// Reserve against the actual output allowance, not the task-size heuristic.
 			requiredOutputTokens: Math.min(options?.maxTokens ?? target.model.maxTokens, target.model.maxTokens),
 		} } };
-		if (!await allowOnFailure(deps.beforeAttempt ? () => deps.beforeAttempt!(target, pending, context) : undefined)) {
+		const allowed = await allowOnFailure(deps.beforeAttempt ? () => deps.beforeAttempt!(target, pending, context) : undefined);
+		if (allowed !== true) {
 			if (probing) deps.circuits.releaseProbe(target.id);
-			lastErrorText = `Pi Auto Model: ${target.id} was blocked by routing policy.`;
+			lastErrorText = typeof allowed === "string" ? `Pi Auto Model: ${target.id}: ${allowed}.`
+				: `Pi Auto Model: ${target.id} was blocked by routing policy.`;
 			continue;
 		}
 		const requestModel = auth.baseUrl ? { ...target.model, baseUrl: auth.baseUrl } : target.model;
