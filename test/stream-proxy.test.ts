@@ -17,6 +17,7 @@ import {
 	type AttemptResult,
 } from "../src/pi/stream-proxy.ts";
 import { CircuitBreaker } from "../src/health/circuit-breaker.ts";
+import { AUTO_MODEL_MAX_TOKENS } from "../src/pi/auto-model.ts";
 import type { RouteTarget, TaskProfile, ThinkingLevel } from "../src/types.ts";
 
 // ─── Test helpers ───────────────────────────────────────────────
@@ -195,6 +196,21 @@ test("budget policy sees the actual output allowance without truncating to the t
 	await collectEvents(handler(model("pi-auto-model", "auto"), { messages: [] }));
 	await collectEvents(handler(model("pi-auto-model", "auto"), { messages: [] }, { maxTokens: 3000 }));
 	assert.deepEqual(seen, [16_000, 16_000, 3000, 3000]);
+});
+
+test("default output allowance uses the same cap as route planning", async () => {
+	const seen: number[] = [];
+	const large = target("openai", "large-output");
+	large.model.contextWindow = 262_144;
+	large.model.maxTokens = 262_144;
+	const providers = new Map([["openai", { streamSimple: (_model: Model<Api>, _ctx: Context, options?: SimpleStreamOptions) => {
+		seen.push(options!.maxTokens!);
+		return streamFromEvents([doneEvent("ok")]);
+	} }]]);
+	const { deps } = makeDeps(makePending([large]), makeFakeRegistry(providers), new CircuitBreaker());
+	deps.beforeAttempt = (_target, request) => { seen.push(request.profile.constraints.requiredOutputTokens); return true; };
+	await collectEvents(createStreamProxyHandler(deps)(model("pi-auto-model", "auto"), { messages: [] }));
+	assert.deepEqual(seen, [AUTO_MODEL_MAX_TOKENS, AUTO_MODEL_MAX_TOKENS]);
 });
 
 test("proxies a successful stream from the first target", async () => {

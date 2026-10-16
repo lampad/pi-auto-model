@@ -422,16 +422,17 @@ function explanation(
 	return reasons;
 }
 
+export function isInPool(target: RouteTarget, pool: WeightedPoolConfig | undefined): boolean {
+	if (!pool) return true;
+	const { targets, providers } = poolEntries(pool);
+	return (targets.size === 0 || targets.has(target.id)) &&
+		(providers.size === 0 || providers.has(target.model.provider));
+}
+
 export function planRoute(input: RoutePlannerInput): RoutePlan | undefined {
 	const policy = normalizeRoutingPolicy(input.policy) ?? "balanced";
 	const contextTokens = input.contextTokens ?? 0;
-	const poolTargets = input.pool
-		? input.targets.filter((target) => {
-			const { targets, providers } = poolEntries(input.pool);
-			return (targets.size === 0 || targets.has(target.id)) &&
-				(providers.size === 0 || providers.has(target.model.provider));
-		})
-		: input.targets;
+	const poolTargets = input.targets.filter((target) => isInPool(target, input.pool));
 	const eligibleTargets = poolTargets.filter((target) =>
 		hardConstraintFailure(target, input.profile, contextTokens, input.capabilityOptions, input.outputTokenLimit) === undefined,
 	);

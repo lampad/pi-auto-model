@@ -45,7 +45,7 @@ import {
 	resolvePiCandidates,
 } from "../src/pi/registry-adapter.ts";
 import { RuntimeStateStore } from "../src/pi/runtime-store.ts";
-import { planRoute, hardConstraintFailure } from "../src/routing/route-planner.ts";
+import { planRoute, hardConstraintFailure, isInPool } from "../src/routing/route-planner.ts";
 import { requestContextTokens } from "../src/pi/request-context.ts";
 import { chooseFailoverTarget } from "../src/routing/failover.ts";
 import { chooseThinkingLevel } from "../src/routing/thinking-router.ts";
@@ -870,9 +870,12 @@ export default function autoModel(pi: ExtensionAPI): void {
 					}
 				: defaultPlan;
 			if (!plan) {
-				const failures = routeTargets.slice(0, 3).map((target) => `${target.id}: ${hardConstraintFailure(
-					target, profile, contextTokensOf(ctx), { source: config.capabilitySource, overrides: config.benchmarkOverrides }, Infinity,
-				) ?? "not eligible under the active pool"}`);
+				const poolTargets = routeTargets.filter((target) => isInPool(target, activePool));
+				const failures = poolTargets.length === 0
+					? [`no candidate is in pool "${poolName}"`]
+					: poolTargets.slice(0, 3).map((target) => `${target.id}: ${hardConstraintFailure(
+						target, profile, contextTokensOf(ctx), { source: config.capabilitySource, overrides: config.benchmarkOverrides }, AUTO_MODEL_MAX_TOKENS,
+					) ?? "not eligible"}`);
 				notifySafe(
 					ctx,
 					`Pi Auto Model: no eligible model can satisfy this task's vision, context, or output requirements. Request blocked. ${failures.join("; ")}`,

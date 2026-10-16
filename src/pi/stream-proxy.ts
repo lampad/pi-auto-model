@@ -26,6 +26,7 @@ import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { RouteTarget, TaskProfile, ThinkingLevel } from "../types.ts";
 import type { CircuitBreaker } from "../health/circuit-breaker.ts";
 import { classifyDetailedError } from "../health/provider-errors.ts";
+import { AUTO_MODEL_MAX_TOKENS } from "./auto-model.ts";
 import { compatibilityAction, stripThinkingForRequest } from "../compat/guard.ts";
 
 // ─── public types ───────────────────────────────────────────────
@@ -356,7 +357,8 @@ async function runFailoverLoop(
 		const pending = { ...plan, attemptId: randomUUID(), profile: { ...plan.profile, constraints: {
 			...plan.profile.constraints,
 			// Reserve against the actual output allowance, not the task-size heuristic.
-			requiredOutputTokens: Math.min(options?.maxTokens ?? target.model.maxTokens, target.model.maxTokens),
+			// Capped like route planning so a target selected there is not rejected here.
+			requiredOutputTokens: Math.min(options?.maxTokens ?? AUTO_MODEL_MAX_TOKENS, target.model.maxTokens),
 		} } };
 		const allowed = await allowOnFailure(deps.beforeAttempt ? () => deps.beforeAttempt!(target, pending, context) : undefined);
 		if (allowed !== true) {
