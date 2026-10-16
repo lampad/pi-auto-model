@@ -126,6 +126,7 @@ export function resolveRoute(input: ResolveRouteInput): ResolveRouteResult | und
 		policy: input.policy ?? config.policy,
 		cacheAware: config.cacheAware?.enabled !== false,
 		costQualityFloor: config.costPolicy?.qualityFloor,
+		costStickinessTolerance: config.costPolicy?.stickinessTolerance,
 		prices,
 		capabilityOptions: input.disableBenchmarks
 			? { source: undefined, overrides: {} }

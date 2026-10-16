@@ -883,6 +883,7 @@ export default function autoModel(pi: ExtensionAPI): void {
 				prices,
 				cacheAware: !coldCache && config.cacheAware?.enabled !== false,
 				costQualityFloor: config.costPolicy?.qualityFloor,
+				costStickinessTolerance: config.costPolicy?.stickinessTolerance,
 				capabilityOptions,
 				preferredTargetIds: preferredTargetIds(targets, rule),
 			});
@@ -1023,6 +1024,8 @@ export default function autoModel(pi: ExtensionAPI): void {
 					costMultipliers,
 					prices,
 					costQualityFloor: config.costPolicy?.qualityFloor,
+					// A budget downgrade must not be vetoed by cost stickiness.
+					costStickinessTolerance: 0,
 					capabilityOptions: { source: config.capabilitySource, overrides: config.benchmarkOverrides },
 				});
 				if (cheaperPlan) {

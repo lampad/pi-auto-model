@@ -187,6 +187,74 @@ test("cost policy honors a configured quality floor", () => {
 	assert.equal(plan?.target.id, "cc-switch-open-router/openai/gpt-5.6-luna");
 });
 
+test("cost policy switches away from a pricier current target despite higher utility", () => {
+	const pricey = target("openai/gpt-5.6-luna", "first");
+	pricey.model.cost = { input: 10, output: 10, cacheRead: 10, cacheWrite: 10 };
+	const cheap = target("model-cheap", "second");
+	cheap.model.cost = { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 };
+	const plan = planRoute({
+		targets: [pricey, cheap],
+		profile: analyzeTask({ prompt: "Explain this function" }),
+		policy: "cost",
+		currentTargetId: pricey.id,
+		contextTokens: 50_000,
+	});
+
+	assert.equal(plan?.target.id, cheap.id);
+});
+
+test("cost policy keeps the current target when its next request is within tolerance", () => {
+	const current = target("model-current", "first");
+	current.model.cost = { input: 1.05, output: 1.05, cacheRead: 1.05, cacheWrite: 1.05 };
+	const cheap = target("model-cheap", "second");
+	const input = {
+		targets: [current, cheap],
+		profile: analyzeTask({ prompt: "Explain this" }),
+		policy: "cost" as const,
+		currentTargetId: current.id,
+	};
+
+	const kept = planRoute(input);
+	assert.equal(kept?.target.id, current.id);
+	assert.ok(kept?.reason.some((reason) => reason.startsWith("kept current target")));
+	assert.equal(planRoute({ ...input, costStickinessTolerance: 0 })?.target.id, cheap.id);
+});
+
+test("cost policy stays on a warm cache when switching would cost more", () => {
+	// Pricier list price, but staying reads 200k cached tokens at $0.3/1M
+	// while switching pays the cheaper model's full $1/1M input.
+	const current = target("model-current", "first");
+	current.model.cost = { input: 3, output: 3, cacheRead: 0.3, cacheWrite: 3.75 };
+	const cheap = target("model-cheap", "second");
+	cheap.model.cost = { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 1.25 };
+	const input = {
+		targets: [current, cheap],
+		profile: analyzeTask({ prompt: "Explain this" }),
+		policy: "cost" as const,
+		currentTargetId: current.id,
+		contextTokens: 200_000,
+	};
+
+	assert.equal(planRoute({ ...input, cacheAware: true })?.target.id, current.id);
+	assert.equal(planRoute(input)?.target.id, cheap.id);
+});
+
+test("cost policy does not keep a current target below the quality floor", () => {
+	const weak = target("openrouter/free", "first");
+	const strong = target("openai/gpt-5.6-luna", "second");
+	const plan = planRoute({
+		targets: [weak, strong],
+		profile: analyzeTask({
+			prompt: "Fix this production error, find the root cause, and add regression tests.\nError: boom\n at run (app.ts:12:3)",
+		}),
+		policy: "cost",
+		costQualityFloor: 0.6,
+		currentTargetId: weak.id,
+	});
+
+	assert.equal(plan?.target.id, strong.id);
+});
+
 test("cost policy ranks by per-request estimate, preferring cheap output for output-heavy tasks", () => {
 	// Blended input+output sums are equal (4 + 4 vs 8 + 0), but the task
 	// needs a large answer, so the cheap-output model wins per request.

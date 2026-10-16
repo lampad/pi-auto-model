@@ -89,6 +89,8 @@ test("loads the cost policy quality floor", async () => {
 	const file = join(dir, "auto-model.json");
 	await writeFile(file, JSON.stringify({ costPolicy: { qualityFloor: 0.6 } }));
 	assert.equal((await loadConfig(file)).costPolicy?.qualityFloor, 0.6);
+	await writeFile(file, JSON.stringify({ costPolicy: { stickinessTolerance: 0.2 } }));
+	assert.equal((await loadConfig(file)).costPolicy?.stickinessTolerance, 0.2);
 });
 
 test("rejects an out-of-range cost policy quality floor", async () => {

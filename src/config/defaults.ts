@@ -58,8 +58,11 @@ export interface AutoModelConfig {
 	cacheAware?: { enabled: boolean };
 	/** Record the automatic choice while keeping the current real target. */
 	shadow?: { enabled: boolean };
-	/** Cost-policy tuning. `qualityFloor` (0-1) sets an optional minimum quality score for cost routing; 0 disables the floor. */
-	costPolicy?: { qualityFloor?: number };
+	/**
+	 * Cost-policy tuning. `qualityFloor` (0-1) sets an optional minimum quality score for cost routing; 0 disables the floor.
+	 * `stickinessTolerance` (0-1, default 0.1) keeps the current target while its next-request cost is at most that fraction above the cheaper pick's.
+	 */
+	costPolicy?: { qualityFloor?: number; stickinessTolerance?: number };
 	/** Price resolution: overrides, multipliers, and the LiteLLM price cache. */
 	pricing?: PricingConfig;
 	/** Shorthand per scenario (task kind, vision, longContext, background); expanded into rules after `rules`. */

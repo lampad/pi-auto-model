@@ -237,7 +237,8 @@ export function isValidConfig(value: unknown): value is Partial<AutoModelConfig>
 		!optionalNumberInRange(value.classifier.confidenceThreshold, 1) || !optionalPositiveNumber(value.classifier.timeoutMs))) return false;
 	if (value.cacheAware !== undefined && (!isRecord(value.cacheAware) || !optionalBoolean(value.cacheAware.enabled))) return false;
 	if (value.shadow !== undefined && (!isRecord(value.shadow) || !optionalBoolean(value.shadow.enabled))) return false;
-	if (value.costPolicy !== undefined && (!isRecord(value.costPolicy) || !optionalNumberInRange(value.costPolicy.qualityFloor, 1))) return false;
+	if (value.costPolicy !== undefined && (!isRecord(value.costPolicy) || !optionalNumberInRange(value.costPolicy.qualityFloor, 1) ||
+		!optionalNumberInRange(value.costPolicy.stickinessTolerance, 1))) return false;
 	if (value.pricing !== undefined && !isValidPricing(value.pricing)) return false;
 	if (!recordValues(value.benchmarkOverrides, (entry) => isRecord(entry) && optionalNumberInRange(entry.ramp, 1) && optionalNumberInRange(entry.aa, 100))) return false;
 	return true;

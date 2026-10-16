@@ -319,7 +319,8 @@ Example:
     "background": "cost"
   },
   "costPolicy": {
-    "qualityFloor": 0
+    "qualityFloor": 0,
+    "stickinessTolerance": 0.1
   },
   "pricing": {
     "costCoef": 1,
@@ -359,6 +360,7 @@ Supported values:
 Optional tuning for the `cost` policy.
 
 - `qualityFloor` (0-1, default `0`): minimum quality score a model must reach to be selectable under the `cost` policy. The default `0` disables the floor, so `cost` simply picks the cheapest eligible model. Set it to `0.6` to restore the previous behavior of "cheapest model that is still good enough".
+- `stickinessTolerance` (0-1, default `0.1`): under `cost`, the current model is kept only when its estimated next-request cost is at most this fraction above the cheaper pick's. With `cacheAware` enabled, staying bills the context at the current model's cache-read price, while switching bills it at the new model's input or cache-write price, whichever is higher. Set `0` to switch whenever the pick is strictly cheaper. A current model below `qualityFloor` is never kept.
 
 #### `pricing`
 

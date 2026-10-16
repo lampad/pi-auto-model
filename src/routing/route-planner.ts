@@ -43,6 +43,11 @@ export interface RoutePlannerInput {
 	cacheAware?: boolean;
 	/** Minimum quality score required for cost-policy selection. Defaults to 0 (no floor). */
 	costQualityFloor?: number;
+	/**
+	 * Under the cost policy, keep the current target while its next-request
+	 * cost is within this fraction above the cheaper pick's. Defaults to 0.1.
+	 */
+	costStickinessTolerance?: number;
 	capabilityOptions?: CapabilityOptions;
 	/** Targets preferred by a matching scenario rule; each receives RULE_PREFER_BONUS utility. */
 	preferredTargetIds?: ReadonlySet<string>;
@@ -449,8 +454,8 @@ export function planRoute(input: RoutePlannerInput): RoutePlan | undefined {
 		.sort((left, right) => right.score.utility - left.score.utility);
 	let selected = scores[0];
 
+	const qualityFloor = Math.min(1, Math.max(0, input.costQualityFloor ?? 0));
 	if (policy === "cost") {
-		const qualityFloor = Math.min(1, Math.max(0, input.costQualityFloor ?? 0));
 		const affordable = qualityFloor > 0
 			? scores.filter(({ score }) => score.quality >= qualityFloor)
 			: scores;
@@ -460,27 +465,80 @@ export function planRoute(input: RoutePlannerInput): RoutePlan | undefined {
 	}
 
 	const current = scores.find(({ score }) => score.targetId === input.currentTargetId);
-	const contextPenalty = Math.min(contextTokens / selected.target.model.contextWindow, 1) * 0.12;
-	if (current && selected.score.utility - current.score.utility <= 0.05 + contextPenalty) {
-		selected = current;
+	let stickinessReason: string | undefined;
+	if (current && current !== selected) {
+		const costDecision = policy === "cost" ? costStickiness(current.target, selected.target, input) : undefined;
+		if (costDecision) {
+			const meetsFloor = qualityFloor <= 0 || current.score.quality >= qualityFloor;
+			if (meetsFloor && costDecision.stayUsd <= costDecision.switchUsd * (1 + costStickinessTolerance(input))) {
+				selected = current;
+				stickinessReason = `kept current target: $${costDecision.stayUsd.toFixed(4)} to stay vs $${costDecision.switchUsd.toFixed(4)} to switch`;
+			}
+		} else {
+			const contextPenalty = Math.min(contextTokens / selected.target.model.contextWindow, 1) * 0.12;
+			if (selected.score.utility - current.score.utility <= 0.05 + contextPenalty) {
+				selected = current;
+			}
+		}
 	}
+
+	const reason = explanation(
+		input.profile,
+		selected.target,
+		selected.score,
+		input.quota?.get(selected.target.model.provider),
+		input.quality?.get(selected.target.id),
+		input.cacheAware,
+		selected.target.id === input.currentTargetId,
+		input.capabilityOptions,
+		policy,
+	);
+	if (stickinessReason) reason.push(stickinessReason);
 
 	return {
 		target: selected.target,
 		thinking: chooseThinkingLevel(selected.target.model, input.profile),
 		policy,
 		score: selected.score,
-		reason: explanation(
-			input.profile,
-			selected.target,
-			selected.score,
-			input.quota?.get(selected.target.model.provider),
-			input.quality?.get(selected.target.id),
-			input.cacheAware,
-			selected.target.id === input.currentTargetId,
-			input.capabilityOptions,
-			policy,
-		),
+		reason,
 		rankedTargets: scores.map((entry) => entry.target),
 	};
+}
+
+const DEFAULT_COST_STICKINESS_TOLERANCE = 0.1;
+
+function costStickinessTolerance(input: RoutePlannerInput): number {
+	const tolerance = input.costStickinessTolerance ?? DEFAULT_COST_STICKINESS_TOLERANCE;
+	return Number.isFinite(tolerance) ? Math.max(0, tolerance) : DEFAULT_COST_STICKINESS_TOLERANCE;
+}
+
+/**
+ * Estimated USD cost of the next request on the current target versus the
+ * cost-policy pick. Under cache economics the current target's context is
+ * assumed warm (billed at cache-read) while the new target must first write
+ * it into its own cache. Returns undefined when either price is unknown.
+ */
+function costStickiness(
+	current: RouteTarget,
+	candidate: RouteTarget,
+	input: RoutePlannerInput,
+): { stayUsd: number; switchUsd: number } | undefined {
+	const stayUsd = nextRequestCostUsd(current, input, true);
+	const switchUsd = nextRequestCostUsd(candidate, input, false);
+	return stayUsd === undefined || switchUsd === undefined ? undefined : { stayUsd, switchUsd };
+}
+
+function nextRequestCostUsd(target: RouteTarget, input: RoutePlannerInput, warm: boolean): number | undefined {
+	// Mirrors costScore, which treats `/free` model IDs as free.
+	if (target.model.id.includes("/free")) return 0;
+	const price = priceOf(target, input);
+	if (price.input + price.output <= 0 && price.source === "unknown") return undefined;
+	const contextTokens = input.contextTokens ?? 0;
+	const inputTokens = Math.max(contextTokens, input.profile.constraints.requiredContextTokens);
+	const cachedTokens = input.cacheAware ? Math.min(contextTokens, inputTokens) : 0;
+	const cachedRate = warm ? cacheReadPerToken(price) : Math.max(inputPerToken(price), cacheWritePerToken(price));
+	const perMillion = cachedTokens * cachedRate +
+		(inputTokens - cachedTokens) * inputPerToken(price) +
+		input.profile.constraints.requiredOutputTokens * price.output;
+	return perMillion * price.coefficient / 1_000_000 * (input.costMultipliers?.get(target.id) ?? 1);
 }
